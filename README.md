@@ -43,6 +43,30 @@ The validator ledger uses `--limit-ledger-size 1000000` so the leaf-record / MMR
 
 ## Local run
 
+### Windows (Docker Desktop)
+
+Compiling the Solana programs in `Dockerfile.railway` takes over an hour on Windows. Pull the prebuilt **linux/amd64** image from GHCR instead.
+
+The package is **private**. Create a GitHub personal access token with the `read:packages` scope, then:
+
+```powershell
+docker login ghcr.io
+# Username: your GitHub username
+# Password: the PAT (read:packages)
+docker compose up
+```
+
+`docker-compose.yml` maps port 8080, mounts a named volume at `/data`, and sets `security_opt: [seccomp:unconfined]`. Docker Desktop’s default seccomp profile blocks **io_uring**, which Agave 4.3 needs.
+
+Open http://127.0.0.1:8080. `/health` should report `ok` after the validator and seed finish (often 30–90 seconds).
+
+Images are published on every push to `main` (and `workflow_dispatch`) as:
+
+- `ghcr.io/watchmeecryt/zama-solana-cleartext-vault:latest`
+- `ghcr.io/watchmeecryt/zama-solana-cleartext-vault:sha-<full-commit-sha>`
+
+### Build the image yourself
+
 Programs are built inside Docker (Anchor **1.2.0**, Solana **4.3.0**, Rust **1.91.1**). The Agave CLI is **linux/amd64** only.
 
 ```bash
@@ -51,10 +75,9 @@ docker run --rm -p 8080:8080 \
   -e PORT=8080 \
   -e DATA_DIR=/data \
   -v cleartext-vault-data:/data \
+  --security-opt seccomp=unconfined \
   cleartext-vault
 ```
-
-Open http://127.0.0.1:8080. `/health` should report `ok` after the validator and seed finish (often 30–90 seconds).
 
 Frontend-only iteration after a stack is already up:
 
@@ -127,6 +150,8 @@ apps/web          React 19 + Vite + MetalUI (light, blue/white)
 packages/demo     Vault flows, settlement (cleartext certs), claim, harvest
 vendor/fhevm      Pinned programs, SDK, clients, IDLs
 Dockerfile.railway
+docker-compose.yml
+.github/workflows/image.yml   GHCR linux/amd64 image on push to main
 ```
 
 `@fhevm/sdk` is **not** on npm. This repo vendors `sdk/js-sdk/src` and exports TypeScript (`./solana`, `./solana/cleartext`).

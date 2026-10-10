@@ -1,0 +1,15 @@
+services:
+  vault:
+    image: ghcr.io/watchmeecryt/zama-solana-cleartext-vault:latest
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      DATA_DIR: /data
+    volumes:
+      - vault-data:/data
+    security_opt:
+      - seccomp:unconfined
+
+volumes:
+  vault-data:
