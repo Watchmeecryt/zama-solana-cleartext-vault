@@ -1,0 +1,1146 @@
+//! Fast, test-only semantic/support-matrix conformance for Solana `fhe_execute`.
+//!
+//! Expected support is test-owned rather than derived from production validators. Execution runs
+//! natively through the host's own cleartext evaluator (`zama_host::cleartext`), the code the
+//! cleartext build runs on chain, and the host's own validators. Mollusk, real TFHE, and
+//! full-stack smoke are deliberately separate test tiers.
+
+use std::collections::HashMap;
+
+use zama_host::{
+    assert_binary_operand_types, assert_ternary_operand_types, assert_unary_operand_type,
+    CoprocessorInputAttestation, FheBinaryOpCode, FheExecuteArgs, FheExecuteOperand,
+    FheExecuteStep, FheTernaryOpCode, FheUnaryOpCode,
+};
+use zama_solana_test_kit::cleartext::{evaluate, Value};
+use zama_solana_test_kit::{binary_contract_tests, composite_contract_tests, unary_contract_tests};
+
+type Handle = [u8; 32];
+/// Operand bits by handle; the handle carries the type.
+type ClearInputs = HashMap<Handle, u128>;
+
+binary_contract_tests!();
+unary_contract_tests!();
+composite_contract_tests!();
+
+fn run_binary(
+    op: FheBinaryOpCode,
+    input_type: u8,
+    scalar_rhs: bool,
+    lhs: u64,
+    rhs: u64,
+    output_type: u8,
+    expected: u64,
+) {
+    let lhs_handle = handle(1, input_type);
+    let rhs_handle = handle(2, input_type);
+    let mut inputs = HashMap::from([(lhs_handle, plain(lhs))]);
+    let rhs = if scalar_rhs {
+        scalar(be(rhs))
+    } else {
+        inputs.insert(rhs_handle, plain(rhs));
+        persistent(rhs_handle)
+    };
+    let execution = args(vec![FheExecuteStep::Binary {
+        op,
+        lhs: persistent(lhs_handle),
+        rhs,
+        output_fhe_type: output_type,
+    }]);
+    assert_eq!(
+        evaluate(&execution, &inputs).unwrap(),
+        vec![value(output_type, expected)]
+    );
+}
+
+fn run_unary(
+    op: FheUnaryOpCode,
+    input_type: u8,
+    input: [u8; 32],
+    output_type: u8,
+    expected: [u8; 32],
+) {
+    let input_handle = handle(1, input_type);
+    let execution = args(vec![FheExecuteStep::Unary {
+        op,
+        operand: persistent(input_handle),
+        output_fhe_type: output_type,
+    }]);
+    let inputs = HashMap::from([(input_handle, bits_be(input))]);
+    assert_eq!(
+        evaluate(&execution, &inputs).unwrap(),
+        vec![value_be(output_type, expected)]
+    );
+}
+
+fn run_ternary(fhe_type: u8, if_true: u64, if_false: u64, expected: u64) {
+    let control = handle(1, 0);
+    let true_handle = handle(2, fhe_type);
+    let false_handle = handle(3, fhe_type);
+    let execution = args(vec![FheExecuteStep::Ternary {
+        op: FheTernaryOpCode::IfThenElse,
+        control: persistent(control),
+        if_true: persistent(true_handle),
+        if_false: persistent(false_handle),
+        output_fhe_type: fhe_type,
+    }]);
+    let inputs = HashMap::from([
+        (control, plain(1)),
+        (true_handle, plain(if_true)),
+        (false_handle, plain(if_false)),
+    ]);
+    assert_eq!(
+        evaluate(&execution, &inputs).unwrap(),
+        vec![value(fhe_type, expected)]
+    );
+}
+
+fn run_trivial(fhe_type: u8, plaintext: u64) {
+    let execution = args(vec![FheExecuteStep::TrivialEncrypt {
+        plaintext: be(plaintext),
+        fhe_type,
+    }]);
+    assert_eq!(
+        evaluate(&execution, &ClearInputs::new()).unwrap(),
+        vec![value(fhe_type, plaintext)]
+    );
+}
+
+fn run_sum(fhe_type: u8, lhs: u64, rhs: u64, expected: u64) {
+    let lhs_handle = handle(1, fhe_type);
+    let rhs_handle = handle(2, fhe_type);
+    let execution = args(vec![sum_step(
+        vec![persistent(lhs_handle), persistent(rhs_handle)],
+        fhe_type,
+    )]);
+    let inputs = HashMap::from([(lhs_handle, plain(lhs)), (rhs_handle, plain(rhs))]);
+    assert_eq!(
+        evaluate(&execution, &inputs).unwrap(),
+        vec![value(fhe_type, expected)]
+    );
+}
+
+fn run_empty_sum(fhe_type: u8) {
+    let execution = args(vec![sum_step(vec![], fhe_type)]);
+    assert_eq!(
+        evaluate(&execution, &ClearInputs::new()).unwrap(),
+        vec![value(fhe_type, 0)]
+    );
+}
+
+fn run_is_in(fhe_type: u8, value: u64, include_set: bool, expected: u64) {
+    let value_handle = handle(1, fhe_type);
+    let member_handle = handle(2, fhe_type);
+    let set = include_set
+        .then(|| persistent(member_handle))
+        .into_iter()
+        .collect();
+    let execution = args(vec![is_in_step(persistent(value_handle), set, fhe_type)]);
+    let mut inputs = HashMap::from([(value_handle, plain(value))]);
+    if include_set {
+        inputs.insert(member_handle, plain(29));
+    }
+    assert_eq!(
+        evaluate(&execution, &inputs).unwrap(),
+        vec![self::value(0, expected)]
+    );
+}
+
+fn run_mul_div(
+    fhe_type: u8,
+    scalar_factor2: bool,
+    factor1: u64,
+    factor2: u64,
+    divisor: u64,
+    expected: u64,
+) {
+    let first_handle = handle(1, fhe_type);
+    let second_handle = handle(2, fhe_type);
+    let mut inputs = HashMap::from([(first_handle, plain(factor1))]);
+    let second = if scalar_factor2 {
+        scalar(be(factor2))
+    } else {
+        inputs.insert(second_handle, plain(factor2));
+        persistent(second_handle)
+    };
+    let execution = args(vec![mul_div_step(
+        persistent(first_handle),
+        second,
+        be(divisor),
+        fhe_type,
+    )]);
+    assert_eq!(
+        evaluate(&execution, &inputs).unwrap(),
+        vec![value(fhe_type, expected)]
+    );
+}
+
+fn run_rand(fhe_type: u8) {
+    let execution = args(vec![FheExecuteStep::Rand { fhe_type }]);
+    let first = evaluate(&execution, &ClearInputs::new()).unwrap();
+    let second = evaluate(&execution, &ClearInputs::new()).unwrap();
+    assert_eq!(first, second, "test random must be repeatable");
+    assert_eq!(first[0].fhe_type, fhe_type);
+    if fhe_type == 0 {
+        assert!(first[0].bits <= 1);
+    }
+}
+
+fn run_rand_bounded(fhe_type: u8, upper_bound: u64) {
+    let execution = args(vec![bounded_rand_step(be(upper_bound), fhe_type)]);
+    let first = evaluate(&execution, &ClearInputs::new()).unwrap();
+    let second = evaluate(&execution, &ClearInputs::new()).unwrap();
+    assert_eq!(first, second, "test bounded random must be repeatable");
+    assert_eq!(first[0].fhe_type, fhe_type);
+    assert!(first[0].bits < u128::from(upper_bound));
+}
+
+mod edges {
+    use super::*;
+    #[test]
+    fn binary_shl_u8_scalar_reduces_shift_modulo_width() {
+        run_binary(FheBinaryOpCode::Shl, 2, true, 1, 9, 2, 2);
+    }
+    #[test]
+    fn binary_shr_u8_scalar_reduces_shift_modulo_width() {
+        run_binary(FheBinaryOpCode::Shr, 2, true, 0x80, 9, 2, 0x40);
+    }
+    #[test]
+    fn binary_rotl_u8_scalar_wraps_high_bit() {
+        run_binary(FheBinaryOpCode::Rotl, 2, true, 0x81, 1, 2, 3);
+    }
+    #[test]
+    fn binary_rotr_u8_scalar_wraps_low_bit() {
+        run_binary(FheBinaryOpCode::Rotr, 2, true, 3, 1, 2, 0x81);
+    }
+    #[test]
+    fn binary_le_u64_scalar_false() {
+        run_binary(FheBinaryOpCode::Le, 5, true, 10, 9, 0, 0);
+    }
+    #[test]
+    fn sum_u8_wraps() {
+        run_sum(2, 250, 10, 4);
+    }
+    #[test]
+    fn ternary_false_selects_false_branch() {
+        let control = handle(1, 0);
+        let if_true = handle(2, 2);
+        let if_false = handle(3, 2);
+        let execution = args(vec![FheExecuteStep::Ternary {
+            op: FheTernaryOpCode::IfThenElse,
+            control: persistent(control),
+            if_true: persistent(if_true),
+            if_false: persistent(if_false),
+            output_fhe_type: 2,
+        }]);
+        let inputs = HashMap::from([
+            (control, plain(0)),
+            (if_true, plain(11)),
+            (if_false, plain(22)),
+        ]);
+        assert_eq!(evaluate(&execution, &inputs).unwrap(), vec![value(2, 22)]);
+    }
+    #[test]
+    fn sum_u8_accepts_exact_narrow_operand_cap() {
+        let narrow = handle(1, 2);
+        let execution = args(vec![sum_step(vec![persistent(narrow); 100], 2)]);
+        assert_eq!(
+            evaluate(&execution, &HashMap::from([(narrow, plain(1))])).unwrap(),
+            vec![value(2, 100)]
+        );
+    }
+    #[test]
+    fn is_in_u128_accepts_exact_wide_set_cap() {
+        let wide = handle(1, 6);
+        let execution = args(vec![is_in_step(
+            persistent(wide),
+            vec![persistent(wide); 60],
+            6,
+        )]);
+        assert_eq!(
+            evaluate(&execution, &HashMap::from([(wide, plain(9))])).unwrap(),
+            vec![value(0, 1)]
+        );
+    }
+    #[test]
+    fn rand_then_bounded_rand_preserves_deterministic_output_order() {
+        let execution = args(vec![
+            FheExecuteStep::Rand { fhe_type: 6 },
+            bounded_rand_step(be(16), 2),
+        ]);
+        let first = evaluate(&execution, &ClearInputs::new()).unwrap();
+        let second = evaluate(&execution, &ClearInputs::new()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!([first[0].fhe_type, first[1].fhe_type], [6, 2]);
+        assert!(first[1].bits < 16);
+    }
+}
+
+mod rejected {
+    use super::*;
+    mod closed_world {
+        use super::*;
+        /// An unshipped width (euint160, euint256) fails with the host's own type error, not
+        /// one of the evaluator's.
+        #[test]
+        fn evaluator_rejects_unshipped_widths_with_the_host_error() {
+            let u160 = handle(1, 7);
+            let u256 = handle(2, 8);
+            let inputs = HashMap::from([(u160, plain(1)), (u256, plain(1))]);
+            // Operands intern into the dictionary `args` drains, so each step is built inside
+            // its own `args` call.
+            let steps: [&dyn Fn() -> FheExecuteStep; 6] = [
+                &|| binary(FheBinaryOpCode::Eq, persistent(u160), persistent(u160), 0),
+                &|| binary(FheBinaryOpCode::Ne, persistent(u256), persistent(u256), 0),
+                &|| binary(FheBinaryOpCode::Rotr, persistent(u256), scalar(be(1)), 8),
+                &|| FheExecuteStep::Unary {
+                    op: FheUnaryOpCode::Not,
+                    operand: persistent(u256),
+                    output_fhe_type: 8,
+                },
+                &|| FheExecuteStep::Unary {
+                    op: FheUnaryOpCode::Cast,
+                    operand: persistent(u256),
+                    output_fhe_type: 2,
+                },
+                &|| is_in_step(persistent(u160), vec![], 7),
+            ];
+            for step in steps {
+                expect_error(args(vec![step()]), inputs.clone(), "UnsupportedFheType");
+            }
+        }
+        #[test]
+        fn binary_unary_and_ternary_admission_is_closed_world() {
+            for op in binary_ops() {
+                for input_type in u8::MIN..=u8::MAX {
+                    for output_type in u8::MIN..=u8::MAX {
+                        for scalar in [false, true] {
+                            let rhs = if scalar { be(1) } else { handle(2, input_type) };
+                            assert_eq!(
+                                assert_binary_operand_types(
+                                    op,
+                                    handle(1, input_type),
+                                    rhs,
+                                    scalar,
+                                    output_type,
+                                )
+                                .is_ok(),
+                                expected_binary(op, input_type, scalar, output_type),
+                                "{op:?}, input={input_type}, scalar={scalar}, output={output_type}"
+                            );
+                        }
+                    }
+                }
+            }
+            for op in unary_ops() {
+                for input_type in u8::MIN..=u8::MAX {
+                    for output_type in u8::MIN..=u8::MAX {
+                        assert_eq!(
+                            assert_unary_operand_type(op, handle(1, input_type), output_type)
+                                .is_ok(),
+                            expected_unary(op, input_type, output_type),
+                            "{op:?}, input={input_type}, output={output_type}"
+                        );
+                    }
+                }
+            }
+            for op in ternary_ops() {
+                for fhe_type in u8::MIN..=u8::MAX {
+                    for (control, if_true, if_false, output) in [
+                        (fhe_type, 2, 2, 2),
+                        (0, fhe_type, 2, 2),
+                        (0, 2, fhe_type, 2),
+                        (0, fhe_type, fhe_type, fhe_type),
+                    ] {
+                        assert_eq!(
+                            ternary_is_accepted(op, control, if_true, if_false, output),
+                            expected_ternary(op, control, if_true, if_false, output),
+                            "{op:?}, control={control}, if_true={if_true}, if_false={if_false}, output={output}"
+                        );
+                    }
+                }
+            }
+        }
+        #[test]
+        fn rem_u8_rejects_scalar_above_u8() {
+            let lhs = handle(1, 2);
+            expect_error(
+                args(vec![binary(
+                    FheBinaryOpCode::Rem,
+                    persistent(lhs),
+                    scalar(be(0x100)),
+                    2,
+                )]),
+                HashMap::from([(lhs, plain(8))]),
+                "ScalarOutOfRange",
+            );
+        }
+        #[test]
+        fn add_u8_rejects_scalar_with_a_high_byte() {
+            let lhs = handle(1, 2);
+            let mut high_only = [0; 32];
+            high_only[0] = 1;
+            expect_error(
+                args(vec![binary(
+                    FheBinaryOpCode::Add,
+                    persistent(lhs),
+                    scalar(high_only),
+                    2,
+                )]),
+                HashMap::from([(lhs, plain(7))]),
+                "ScalarOutOfRange",
+            );
+        }
+        #[test]
+        fn eq_bool_rejects_scalar_above_one() {
+            let lhs = handle(1, 0);
+            expect_error(
+                args(vec![binary(
+                    FheBinaryOpCode::Eq,
+                    persistent(lhs),
+                    scalar(be(2)),
+                    0,
+                )]),
+                HashMap::from([(lhs, plain(0))]),
+                "ScalarOutOfRange",
+            );
+        }
+        #[test]
+        fn div_u8_rejects_scalar_above_u8() {
+            let lhs = handle(1, 2);
+            expect_error(
+                args(vec![binary(
+                    FheBinaryOpCode::Div,
+                    persistent(lhs),
+                    scalar(be(0x100)),
+                    2,
+                )]),
+                HashMap::from([(lhs, plain(8))]),
+                "ScalarOutOfRange",
+            );
+        }
+        #[test]
+        fn eq_u8_u16_encrypted_types_must_match() {
+            let lhs = handle(1, 2);
+            let rhs = handle(2, 3);
+            expect_error(
+                args(vec![binary(
+                    FheBinaryOpCode::Eq,
+                    persistent(lhs),
+                    persistent(rhs),
+                    0,
+                )]),
+                HashMap::from([(lhs, plain(1)), (rhs, plain(1))]),
+                "BinaryOperandTypeMismatch",
+            );
+        }
+    }
+    mod ternary {
+        use super::*;
+        #[test]
+        fn if_then_else_rejects_mixed_branch_types() {
+            let control = handle(1, 0);
+            let if_true = handle(2, 2);
+            let if_false = handle(3, 3);
+            let execution = args(vec![FheExecuteStep::Ternary {
+                op: FheTernaryOpCode::IfThenElse,
+                control: persistent(control),
+                if_true: persistent(if_true),
+                if_false: persistent(if_false),
+                output_fhe_type: 2,
+            }]);
+            let inputs = HashMap::from([
+                (control, plain(1)),
+                (if_true, plain(11)),
+                (if_false, plain(22)),
+            ]);
+            expect_error(execution, inputs, "InvalidInputHandleType");
+        }
+        #[test]
+        fn if_then_else_rejects_unsupported_output() {
+            let control = handle(1, 0);
+            let unshipped_branch = handle(2, 1);
+            let execution = args(vec![FheExecuteStep::Ternary {
+                op: FheTernaryOpCode::IfThenElse,
+                control: persistent(control),
+                if_true: persistent(unshipped_branch),
+                if_false: persistent(unshipped_branch),
+                output_fhe_type: 1,
+            }]);
+            expect_error(
+                execution,
+                HashMap::from([(control, plain(1)), (unshipped_branch, plain(0))]),
+                "UnsupportedFheType",
+            );
+        }
+    }
+    mod composite {
+        use super::*;
+        #[test]
+        fn trivial_encrypt_bool_rejects_plaintext_above_one() {
+            let mut high_only = [0; 32];
+            high_only[0] = 1;
+            expect_error(
+                args(vec![FheExecuteStep::TrivialEncrypt {
+                    plaintext: high_only,
+                    fhe_type: 0,
+                }]),
+                ClearInputs::new(),
+                "ScalarOutOfRange",
+            );
+        }
+        #[test]
+        fn trivial_encrypt_u8_rejects_plaintext_above_u8() {
+            expect_error(
+                args(vec![FheExecuteStep::TrivialEncrypt {
+                    plaintext: be(0x100),
+                    fhe_type: 2,
+                }]),
+                ClearInputs::new(),
+                "ScalarOutOfRange",
+            );
+        }
+        #[test]
+        fn trivial_encrypt_unknown_type() {
+            expect_error(
+                args(vec![FheExecuteStep::TrivialEncrypt {
+                    plaintext: be(1),
+                    fhe_type: 1,
+                }]),
+                ClearInputs::new(),
+                "UnsupportedFheType",
+            );
+        }
+        #[test]
+        fn sum_u256_type() {
+            let input = handle(1, 8);
+            expect_error(
+                args(vec![sum_step(vec![persistent(input)], 8)]),
+                HashMap::from([(input, plain(1))]),
+                "UnsupportedFheType",
+            );
+        }
+        #[test]
+        fn sum_u8_over_narrow_cap() {
+            let input = handle(1, 2);
+            expect_error(
+                args(vec![sum_step(vec![persistent(input); 101], 2)]),
+                HashMap::from([(input, plain(1))]),
+                "InvalidFheExecuteAccount",
+            );
+        }
+        #[test]
+        fn is_in_bool_type() {
+            let input = handle(1, 0);
+            expect_error(
+                args(vec![is_in_step(persistent(input), vec![], 0)]),
+                HashMap::from([(input, plain(1))]),
+                "UnsupportedFheType",
+            );
+        }
+        #[test]
+        fn is_in_u256_type() {
+            let input = handle(1, 8);
+            expect_error(
+                args(vec![is_in_step(persistent(input), vec![], 8)]),
+                HashMap::from([(input, plain(1))]),
+                "UnsupportedFheType",
+            );
+        }
+        #[test]
+        fn is_in_u128_over_wide_cap() {
+            let input = handle(1, 6);
+            expect_error(
+                args(vec![is_in_step(
+                    persistent(input),
+                    vec![persistent(input); 61],
+                    6,
+                )]),
+                HashMap::from([(input, plain(1))]),
+                "InvalidFheExecuteAccount",
+            );
+        }
+        #[test]
+        fn sum_rejects_mixed_types() {
+            let u8_input = handle(1, 2);
+            let u16_input = handle(2, 3);
+            expect_error(
+                args(vec![sum_step(
+                    vec![persistent(u8_input), persistent(u16_input)],
+                    2,
+                )]),
+                HashMap::from([(u8_input, plain(1)), (u16_input, plain(1))]),
+                "BinaryOperandTypeMismatch",
+            );
+        }
+        #[test]
+        fn is_in_rejects_mixed_types() {
+            let u8_input = handle(1, 2);
+            let u16_input = handle(2, 3);
+            expect_error(
+                args(vec![is_in_step(
+                    persistent(u8_input),
+                    vec![persistent(u16_input)],
+                    2,
+                )]),
+                HashMap::from([(u8_input, plain(1)), (u16_input, plain(1))]),
+                "BinaryOperandTypeMismatch",
+            );
+        }
+        #[test]
+        fn mul_div_u128_output_type() {
+            let input = handle(1, 6);
+            expect_error(
+                args(vec![mul_div_step(
+                    persistent(input),
+                    scalar(be(2)),
+                    be(1),
+                    6,
+                )]),
+                HashMap::from([(input, plain(2))]),
+                "UnsupportedFheType",
+            );
+        }
+        #[test]
+        fn mul_div_rejects_divisor_above_u8() {
+            let u8_input = handle(1, 2);
+            expect_error(
+                args(vec![mul_div_step(
+                    persistent(u8_input),
+                    scalar(be(2)),
+                    be(0x100),
+                    2,
+                )]),
+                HashMap::from([(u8_input, plain(2))]),
+                "ScalarOutOfRange",
+            );
+        }
+        #[test]
+        fn mul_div_rejects_mixed_factor_types() {
+            let u8_input = handle(1, 2);
+            let u16_input = handle(2, 3);
+            expect_error(
+                args(vec![mul_div_step(
+                    persistent(u8_input),
+                    persistent(u16_input),
+                    be(1),
+                    2,
+                )]),
+                HashMap::from([(u8_input, plain(2)), (u16_input, plain(2))]),
+                "BinaryOperandTypeMismatch",
+            );
+        }
+        #[test]
+        fn rand_u160_type() {
+            expect_error(
+                args(vec![FheExecuteStep::Rand { fhe_type: 7 }]),
+                ClearInputs::new(),
+                "UnsupportedFheType",
+            );
+        }
+        #[test]
+        fn bounded_rand_bool_type() {
+            expect_error(
+                args(vec![bounded_rand_step(be(2), 0)]),
+                ClearInputs::new(),
+                "UnsupportedFheType",
+            );
+        }
+        #[test]
+        fn bounded_rand_non_power_of_two() {
+            expect_error(
+                args(vec![bounded_rand_step(be(3), 2)]),
+                ClearInputs::new(),
+                "InvalidRandomUpperBound",
+            );
+        }
+        #[test]
+        fn bounded_rand_zero() {
+            expect_error(
+                args(vec![bounded_rand_step(be(0), 2)]),
+                ClearInputs::new(),
+                "InvalidRandomUpperBound",
+            );
+        }
+        #[test]
+        fn bounded_rand_u8_too_wide() {
+            expect_error(
+                args(vec![bounded_rand_step(be(512), 2)]),
+                ClearInputs::new(),
+                "InvalidRandomUpperBound",
+            );
+        }
+    }
+}
+
+mod operand_sources {
+    use super::*;
+    #[test]
+    fn verified_input_can_seed_an_operation() {
+        let input = handle(1, 2);
+        let execution = args(vec![binary(
+            FheBinaryOpCode::Add,
+            verified(
+                input,
+                zama_solana_test_kit::cleartext::input_extra_data(&[value(2, 4)]),
+            ),
+            scalar(be(3)),
+            2,
+        )]);
+        assert_eq!(
+            evaluate(&execution, &ClearInputs::new()).unwrap(),
+            vec![value(2, 7)]
+        );
+    }
+    #[test]
+    fn local_outputs_can_feed_later_steps() {
+        let input = handle(1, 2);
+        let execution = args(vec![
+            binary(FheBinaryOpCode::Add, persistent(input), scalar(be(1)), 2),
+            FheExecuteStep::Unary {
+                op: FheUnaryOpCode::Not,
+                operand: FheExecuteOperand::EarlierStep { producer_index: 0 },
+                output_fhe_type: 2,
+            },
+        ]);
+        assert_eq!(
+            evaluate(&execution, &HashMap::from([(input, plain(1))])).unwrap(),
+            vec![value(2, 2), value(2, 253)]
+        );
+    }
+    #[test]
+    fn self_local_is_rejected() {
+        reject_local(0);
+    }
+    #[test]
+    fn forward_local_is_rejected() {
+        reject_local(1);
+    }
+    fn reject_local(producer_index: u8) {
+        expect_error(
+            args(vec![FheExecuteStep::Unary {
+                op: FheUnaryOpCode::Not,
+                operand: FheExecuteOperand::EarlierStep { producer_index },
+                output_fhe_type: 2,
+            }]),
+            ClearInputs::new(),
+            "FheExecuteEarlierStepMissing",
+        );
+    }
+    #[test]
+    fn missing_verified_input_seed_is_rejected() {
+        let input = handle(1, 2);
+        expect_error(
+            args(vec![binary(
+                FheBinaryOpCode::Add,
+                verified(input, vec![0x00]),
+                scalar(be(1)),
+                2,
+            )]),
+            ClearInputs::new(),
+            "InputMalformed",
+        );
+    }
+    #[test]
+    fn scalar_in_encrypted_position_is_rejected() {
+        expect_error(
+            args(vec![binary(
+                FheBinaryOpCode::Add,
+                scalar(be(1)),
+                scalar(be(2)),
+                2,
+            )]),
+            ClearInputs::new(),
+            "InvalidFheExecuteAccount",
+        );
+    }
+}
+
+/// The operator cases of the EVM e2e (`library-solidity/codegen/overloads/e2e.json`), which run
+/// against the real coprocessor, so their outputs are what tfhe-rs computes. Every case on operand
+/// types the Solana host takes must come out the same here.
+mod evm_e2e_cases {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const CASES: &str = include_str!("../../../library-solidity/codegen/overloads/e2e.json");
+
+    #[derive(serde::Deserialize)]
+    struct Case {
+        inputs: Vec<String>,
+        output: serde_json::Value,
+    }
+
+    /// The FHE type of an operand name, and whether it is encrypted; `None` for a type Solana
+    /// does not ship (`euint256`).
+    fn operand(name: &str) -> Option<(u8, bool)> {
+        let (encrypted, plain) = match name.strip_prefix('e') {
+            Some(plain) => (true, plain),
+            None => (false, name),
+        };
+        let fhe_type = match plain {
+            "uint8" => 2,
+            "uint16" => 3,
+            "uint32" => 4,
+            "uint64" => 5,
+            "uint128" => 6,
+            _ => return None,
+        };
+        Some((fhe_type, encrypted))
+    }
+
+    fn binary_op(name: &str) -> FheBinaryOpCode {
+        use FheBinaryOpCode::*;
+        match name {
+            "add" => Add,
+            "sub" => Sub,
+            "mul" => Mul,
+            "div" => Div,
+            "rem" => Rem,
+            "and" => And,
+            "or" => Or,
+            "xor" => Xor,
+            "shl" => Shl,
+            "shr" => Shr,
+            "rotl" => Rotl,
+            "rotr" => Rotr,
+            "eq" => Eq,
+            "ne" => Ne,
+            "ge" => Ge,
+            "gt" => Gt,
+            "le" => Le,
+            "lt" => Lt,
+            "min" => Min,
+            "max" => Max,
+            other => panic!("e2e.json names an operator this test does not map: {other}"),
+        }
+    }
+
+    fn be128(value: u128) -> [u8; 32] {
+        let mut bytes = [0; 32];
+        bytes[16..].copy_from_slice(&value.to_be_bytes());
+        bytes
+    }
+
+    fn expected(output: &serde_json::Value) -> u128 {
+        match output {
+            serde_json::Value::Bool(bit) => u128::from(*bit),
+            serde_json::Value::String(number) => number.parse().unwrap(),
+            other => panic!("unexpected e2e.json output {other}"),
+        }
+    }
+
+    #[test]
+    fn the_evaluator_agrees_with_the_evm_e2e_cases() {
+        let overloads: BTreeMap<String, Vec<Case>> = serde_json::from_str(CASES).unwrap();
+        let mut checked = BTreeSet::new();
+        for (overload, cases) in &overloads {
+            let parts: Vec<&str> = overload.split('_').collect();
+            if parts[1..].iter().any(|name| operand(name).is_none()) {
+                continue;
+            }
+            for case in cases {
+                let inputs: Vec<u128> = case
+                    .inputs
+                    .iter()
+                    .map(|input| input.parse().unwrap())
+                    .collect();
+                let want = expected(&case.output);
+                let (step, operands, output_type) = match parts.as_slice() {
+                    [op @ ("not" | "neg"), name] => {
+                        let Some((fhe_type, true)) = operand(name) else {
+                            continue;
+                        };
+                        let op = if *op == "not" {
+                            FheUnaryOpCode::Not
+                        } else {
+                            FheUnaryOpCode::Neg
+                        };
+                        let input = handle(1, fhe_type);
+                        let step = FheExecuteStep::Unary {
+                            op,
+                            operand: persistent(input),
+                            output_fhe_type: fhe_type,
+                        };
+                        (step, HashMap::from([(input, inputs[0])]), fhe_type)
+                    }
+                    [op, lhs, rhs] => {
+                        // The Solana host takes an encrypted lhs and an rhs of the same type,
+                        // encrypted or scalar; the EVM library casts the other pairs first.
+                        let (Some((lhs_type, true)), Some((rhs_type, rhs_encrypted))) =
+                            (operand(lhs), operand(rhs))
+                        else {
+                            continue;
+                        };
+                        if lhs_type != rhs_type {
+                            continue;
+                        }
+                        let op = binary_op(op);
+                        let lhs_handle = handle(1, lhs_type);
+                        let mut operands = HashMap::from([(lhs_handle, inputs[0])]);
+                        let rhs = if rhs_encrypted {
+                            let rhs_handle = handle(2, rhs_type);
+                            operands.insert(rhs_handle, inputs[1]);
+                            persistent(rhs_handle)
+                        } else {
+                            scalar(be128(inputs[1]))
+                        };
+                        let output_type = match op {
+                            FheBinaryOpCode::Eq
+                            | FheBinaryOpCode::Ne
+                            | FheBinaryOpCode::Ge
+                            | FheBinaryOpCode::Gt
+                            | FheBinaryOpCode::Le
+                            | FheBinaryOpCode::Lt => 0,
+                            _ => lhs_type,
+                        };
+                        (
+                            binary(op, persistent(lhs_handle), rhs, output_type),
+                            operands,
+                            output_type,
+                        )
+                    }
+                    _ => panic!("unexpected e2e.json overload {overload}"),
+                };
+                let result = evaluate(&args(vec![step]), &operands)
+                    .unwrap_or_else(|error| panic!("{overload} {:?}: {error:?}", case.inputs));
+                assert_eq!(
+                    result,
+                    vec![Value::new(output_type, want).unwrap()],
+                    "{overload} {:?}",
+                    case.inputs
+                );
+                checked.insert(parts[0]);
+            }
+        }
+        // Every operator must keep at least one case, so the filter above cannot drop one silently.
+        let named: BTreeSet<&str> = overloads
+            .keys()
+            .map(|key| key.split('_').next().unwrap())
+            .collect();
+        assert_eq!(checked, named);
+    }
+}
+
+fn binary_ops() -> [FheBinaryOpCode; 20] {
+    use FheBinaryOpCode::*;
+    [
+        Add, Sub, Mul, Div, Rem, And, Or, Xor, Shl, Shr, Rotl, Rotr, Eq, Ne, Ge, Gt, Le, Lt, Min,
+        Max,
+    ]
+}
+
+fn expected_binary(op: FheBinaryOpCode, input: u8, scalar: bool, output: u8) -> bool {
+    use FheBinaryOpCode::*;
+    match op {
+        Add | Sub | Mul | Min | Max => matches!(input, 2..=6) && output == input,
+        Div | Rem => matches!(input, 2..=6) && scalar && output == input,
+        And | Or | Xor => matches!(input, 0 | 2..=6) && output == input,
+        Shl | Shr | Rotl | Rotr => matches!(input, 2..=6) && output == input,
+        Eq | Ne => matches!(input, 0 | 2..=6) && output == 0,
+        Ge | Gt | Le | Lt => matches!(input, 2..=6) && output == 0,
+    }
+}
+
+fn unary_ops() -> [FheUnaryOpCode; 3] {
+    [
+        FheUnaryOpCode::Neg,
+        FheUnaryOpCode::Not,
+        FheUnaryOpCode::Cast,
+    ]
+}
+
+fn expected_unary(op: FheUnaryOpCode, input: u8, output: u8) -> bool {
+    match op {
+        FheUnaryOpCode::Neg => matches!(input, 2..=6) && output == input,
+        FheUnaryOpCode::Not => matches!(input, 0 | 2..=6) && output == input,
+        FheUnaryOpCode::Cast => {
+            matches!(input, 0 | 2..=6) && matches!(output, 2..=6) && input != output
+        }
+    }
+}
+
+fn ternary_ops() -> [FheTernaryOpCode; 1] {
+    [FheTernaryOpCode::IfThenElse]
+}
+
+fn expected_ternary(
+    op: FheTernaryOpCode,
+    control: u8,
+    if_true: u8,
+    if_false: u8,
+    output: u8,
+) -> bool {
+    match op {
+        FheTernaryOpCode::IfThenElse => {
+            control == 0 && matches!(if_true, 0 | 2..=6) && if_true == output && if_false == output
+        }
+    }
+}
+
+fn ternary_is_accepted(
+    op: FheTernaryOpCode,
+    control_type: u8,
+    if_true_type: u8,
+    if_false_type: u8,
+    output: u8,
+) -> bool {
+    match op {
+        FheTernaryOpCode::IfThenElse => assert_ternary_operand_types(
+            handle(1, control_type),
+            handle(2, if_true_type),
+            handle(3, if_false_type),
+            output,
+        )
+        .is_ok(),
+    }
+}
+
+fn expect_error(execution: FheExecuteArgs, inputs: ClearInputs, expected: &str) {
+    let error = format!("{:?}", evaluate(&execution, &inputs).unwrap_err());
+    assert!(
+        error.contains(expected),
+        "expected error containing {expected:?}, got {error:?}"
+    );
+}
+
+fn binary(
+    op: FheBinaryOpCode,
+    lhs: FheExecuteOperand,
+    rhs: FheExecuteOperand,
+    output_fhe_type: u8,
+) -> FheExecuteStep {
+    FheExecuteStep::Binary {
+        op,
+        lhs,
+        rhs,
+        output_fhe_type,
+    }
+}
+
+fn sum_step(operands: Vec<FheExecuteOperand>, fhe_type: u8) -> FheExecuteStep {
+    FheExecuteStep::Sum { operands, fhe_type }
+}
+
+fn is_in_step(
+    value: FheExecuteOperand,
+    set: Vec<FheExecuteOperand>,
+    fhe_type: u8,
+) -> FheExecuteStep {
+    FheExecuteStep::IsIn {
+        value,
+        set,
+        fhe_type,
+    }
+}
+
+fn mul_div_step(
+    factor1: FheExecuteOperand,
+    factor2: FheExecuteOperand,
+    divisor: [u8; 32],
+    output_fhe_type: u8,
+) -> FheExecuteStep {
+    FheExecuteStep::MulDiv {
+        factor1,
+        factor2,
+        divisor,
+        output_fhe_type,
+    }
+}
+
+fn bounded_rand_step(upper_bound: [u8; 32], fhe_type: u8) -> FheExecuteStep {
+    FheExecuteStep::RandBounded {
+        upper_bound,
+        fhe_type,
+    }
+}
+
+// FheExecution constants (operand handles, scalar values) live in the execution's interned dictionary
+// and are referenced by `u8` index (fhevm-internal#1853 W7). The helpers below intern
+// through a thread-local dictionary: `persistent`/`scalar` add entries while a test assembles
+// steps, and `args` drains the dictionary into the finished execution. Each test runs on its own
+// thread, so dictionaries never mix across tests.
+std::thread_local! {
+    static INTERNED_DICTIONARY: std::cell::RefCell<Vec<[u8; 32]>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn intern(bytes: [u8; 32]) -> u8 {
+    INTERNED_DICTIONARY.with(|dictionary| {
+        let mut dictionary = dictionary.borrow_mut();
+        if let Some(index) = dictionary.iter().position(|entry| *entry == bytes) {
+            return u8::try_from(index).expect("test dictionary fits u8");
+        }
+        let index = u8::try_from(dictionary.len()).expect("test dictionary fits u8");
+        dictionary.push(bytes);
+        index
+    })
+}
+
+fn args(steps: Vec<FheExecuteStep>) -> FheExecuteArgs {
+    FheExecuteArgs {
+        execution_store_index: 0,
+        effects: vec![],
+        returned_results: Vec::new(),
+        account_count: 0,
+        dictionary: INTERNED_DICTIONARY.with(|dictionary| dictionary.take()),
+        steps,
+    }
+}
+
+fn scalar(value: [u8; 32]) -> FheExecuteOperand {
+    FheExecuteOperand::Scalar {
+        value_index: intern(value),
+    }
+}
+
+fn persistent(handle: Handle) -> FheExecuteOperand {
+    FheExecuteOperand::StoreSlot {
+        handle_index: intern(handle),
+        store_index: 0,
+        key_index: intern([0; 32]),
+    }
+}
+
+fn verified(input_handle: Handle, extra_data: Vec<u8>) -> FheExecuteOperand {
+    FheExecuteOperand::VerifiedInput {
+        attestation: Box::new(CoprocessorInputAttestation {
+            input_handle,
+            ct_handles: vec![input_handle],
+            handle_index: 0,
+            user_address: [0; 32],
+            contract_address: [0; 32],
+            contract_chain_id: 1,
+            extra_data,
+            signatures: vec![[0; 65]],
+        }),
+    }
+}
+
+fn handle(seed: u8, fhe_type: u8) -> Handle {
+    let mut handle = [0; 32];
+    handle[0] = seed;
+    handle[30] = fhe_type;
+    handle
+}
+
+/// An operand's bits; its type comes from its handle.
+fn plain(value: u64) -> u128 {
+    value.into()
+}
+
+fn bits_be(bytes: [u8; 32]) -> u128 {
+    u128::from_be_bytes(bytes[16..].try_into().unwrap())
+}
+
+fn value(fhe_type: u8, bits: u64) -> Value {
+    Value::new(fhe_type, bits.into()).unwrap()
+}
+
+fn value_be(fhe_type: u8, bytes: [u8; 32]) -> Value {
+    Value::from_be_bytes(fhe_type, bytes).unwrap()
+}
+
+fn be(value: u64) -> [u8; 32] {
+    zama_solana_test_kit::u256_be(value)
+}

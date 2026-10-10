@@ -1,0 +1,25 @@
+[toolchain]
+anchor_version = "1.2.0"
+solana_version = "4.3.0"
+
+[features]
+resolution = true
+skip-lint = false
+
+# One id per program on every cluster (solana/environments/preview-env.json). The test validator
+# loads the programs at genesis, so no program keypair is committed; builds use --ignore-keys and
+# deploys go through solana/deploy.
+[programs.localnet]
+confidential_batcher = "DAVFjzkMrUZnX9wqbYbAGiPTHQPTmdZ2C9kNsuSykJHb"
+confidential_token = "FAWs7E52LZmXR5YzFy4aXanfBjNtXV2qooQVtkmBa3cL"
+demo_vault = "DKuvkbkqo71fnbTsSNFzGCH1gT7FhKZU45bMqTSxxSFH"
+zama_host = "DPq5y89RDZPq9NcMh9X1NgjBWgYmSXg3QoipSBV3ZMzQ"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "cargo test --workspace"
+
+[hooks]

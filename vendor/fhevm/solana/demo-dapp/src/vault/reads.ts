@@ -1,0 +1,114 @@
+import {
+  getBase58Decoder,
+  getBase64Encoder,
+  type Address,
+  type Base58EncodedBytes,
+  type Rpc,
+  type SolanaRpcApi,
+} from '@solana/kit';
+
+import {
+  type FhevmSolanaBaseClient,
+  type SolanaEncryptedStore,
+} from '@fhevm/sdk/solana';
+import { fetchBatch, type Batch } from './internal/generated/confidentialBatcher/accounts/batch.js';
+import { fetchBatcher, type Batcher } from './internal/generated/confidentialBatcher/accounts/batcher.js';
+import {
+  fetchJoinRecord,
+  getJoinRecordDecoder,
+  getJoinRecordSize,
+  JOIN_RECORD_DISCRIMINATOR,
+  type JoinRecord,
+} from './internal/generated/confidentialBatcher/accounts/joinRecord.js';
+import { CONFIDENTIAL_BATCHER_PROGRAM_ADDRESS } from './internal/generated/confidentialBatcher/programAddress.js';
+import { deriveBatchAddresses, type BatchAddresses, type VaultDemoRoots } from './derive.js';
+
+/** The batcher config's decoded on-chain state (generated decoder). */
+export type BatcherState = Batcher;
+/** A batch's decoded on-chain state (generated decoder). */
+export type BatchState = Batch;
+/** A `(batch, user)` join record's decoded on-chain state (generated decoder). */
+export type JoinRecordState = JoinRecord;
+
+type SolanaRpc = Rpc<SolanaRpcApi>;
+
+/** Reads a batcher config via the generated `Batcher` decoder. */
+export async function getBatcher(rpc: SolanaRpc, batcher: Address): Promise<BatcherState> {
+  const account = await fetchBatcher(rpc, batcher);
+  return account.data;
+}
+
+/** Unix time from which a pending batch may be dispatched. */
+export function dispatchableAt(batch: BatchState, batcher: BatcherState): bigint {
+  return batch.openedAt + batcher.minBatchAgeSecs;
+}
+
+/** Unix time from which a dispatched batch can no longer settle and anyone may cancel it. */
+export function settleDeadline(batch: BatchState, batcher: BatcherState): bigint {
+  return batch.dispatchedAt + batcher.settleDeadlineSecs;
+}
+
+/**
+ * Reads a `(batch, user)` join record via the generated `JoinRecord` decoder — derive the address
+ * with the generated `findJoinRecordPda`. Throws if the record does not exist (the user never joined the
+ * batch).
+ */
+export async function getJoinRecord(
+  rpc: SolanaRpc,
+  joinRecord: Address,
+): Promise<JoinRecordState> {
+  const account = await fetchJoinRecord(rpc, joinRecord);
+  return account.data;
+}
+
+/** Reads every join record of `batch` that still exists: one per participant who has not exited. */
+export async function getBatchJoinRecords(rpc: SolanaRpc, batch: Address): Promise<JoinRecordState[]> {
+  const memcmp = (offset: bigint, bytes: Base58EncodedBytes) => ({ memcmp: { offset, bytes, encoding: 'base58' as const } });
+  const accounts = await rpc
+    .getProgramAccounts(CONFIDENTIAL_BATCHER_PROGRAM_ADDRESS, {
+      encoding: 'base64',
+      filters: [
+        { dataSize: BigInt(getJoinRecordSize()) },
+        memcmp(0n, getBase58Decoder().decode(JOIN_RECORD_DISCRIMINATOR) as Base58EncodedBytes),
+        memcmp(8n, batch as string as Base58EncodedBytes),
+      ],
+    })
+    .send();
+  return accounts.map(({ account }) => getJoinRecordDecoder().decode(getBase64Encoder().encode(account.data[0])));
+}
+
+/**
+ * Resolves the batcher's most-recently-opened batch: its zero-based index, its derived addresses,
+ * and its decoded state. `Batcher.nextBatchIndex` is the index the *next* `open_batch` will use, so
+ * the current batch is one before it. Throws if no batch has been opened yet (index 0).
+ */
+export async function getCurrentBatch(
+  rpc: SolanaRpc,
+  roots: VaultDemoRoots,
+): Promise<{ index: bigint; addresses: BatchAddresses; state: BatchState }> {
+  const batcher = await getBatcher(rpc, roots.batcher);
+  if (batcher.nextBatchIndex === 0n) {
+    throw new Error(`batcher ${roots.batcher} has opened no batches yet (nextBatchIndex is 0)`);
+  }
+  const index = batcher.nextBatchIndex - 1n;
+  return getBatchByIndex(rpc, roots, index);
+}
+
+/** Reads one pinned historical or current batch by its index. */
+export async function getBatchByIndex(
+  rpc: SolanaRpc,
+  roots: VaultDemoRoots,
+  index: bigint,
+): Promise<{ index: bigint; addresses: BatchAddresses; state: BatchState }> {
+  const addresses = await deriveBatchAddresses(roots, index);
+  const account = await fetchBatch(rpc, addresses.batch);
+  return { index, addresses, state: account.data };
+}
+
+/** Reads the host-owned slot dictionary and shared MMR at `finalized` through the SDK decoder. */
+export function getEncryptedStore(
+  client: Pick<FhevmSolanaBaseClient, 'fetchEncryptedStore'>,
+  address: Address,
+): Promise<SolanaEncryptedStore> {
+  return client.fetchEncryptedStore(address);
+}

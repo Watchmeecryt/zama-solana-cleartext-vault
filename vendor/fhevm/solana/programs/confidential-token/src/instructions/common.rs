@@ -1,0 +1,641 @@
+//! Shared confidential-token instruction helpers.
+//!
+//! This module holds cross-instruction account shape checks, FHE CPI builders,
+//! and deterministic labels used by the token handlers.
+
+use super::*;
+
+pub(crate) fn assert_no_remaining_accounts(remaining_accounts: &[AccountInfo]) -> Result<()> {
+    require!(
+        remaining_accounts.is_empty(),
+        ConfidentialTokenError::UnexpectedRemainingAccounts
+    );
+    Ok(())
+}
+
+pub(crate) struct TransferAccounts<'a, 'info> {
+    pub(crate) payer: &'a Signer<'info>,
+    /// The sender's signing owner: the transfer authority, and the value authority of an
+    /// existing amount it controls itself.
+    pub(crate) transfer_authority: &'a Signer<'info>,
+    pub(crate) mint: &'a Account<'info, ConfidentialMint>,
+    pub(crate) from_account: &'a Account<'info, ConfidentialTokenAccount>,
+    pub(crate) to_account: &'a Account<'info, ConfidentialTokenAccount>,
+    /// Sender state: read and update its balance slot.
+    pub(crate) from_store: AccountInfo<'info>,
+    /// Recipient state: read and update its balance slot.
+    pub(crate) to_store: AccountInfo<'info>,
+    pub(crate) zama_event_authority: &'a UncheckedAccount<'info>,
+    pub(crate) transient_store: &'a UncheckedAccount<'info>,
+    pub(crate) instructions: &'a UncheckedAccount<'info>,
+    pub(crate) zama_program: &'a Program<'info, ZamaHost>,
+    pub(crate) host_config: &'a Account<'info, zama_host::HostConfig>,
+    /// Deny records for the token and input Store applications,
+    /// omitting absent and duplicate applications.
+    pub(crate) remaining_accounts: &'a [AccountInfo<'info>],
+    pub(crate) system_program: &'a Program<'info, System>,
+    /// Per-mint HCU block meter forwarded into the host `fhe_execute` CPI (`None` = untrusted,
+    /// no meter). The host keys the meter on the application `(program, mint)`.
+    pub(crate) hcu_block_meter: Option<AccountInfo<'info>>,
+    /// HCU trust witness forwarded into the host `fhe_execute` CPI (`None` = untrusted).
+    pub(crate) hcu_trusted_app_record: Option<AccountInfo<'info>>,
+    /// Underlying SPL mint whose owner is the token program. Freeze checks read this account.
+    pub(crate) underlying_mint: AccountInfo<'info>,
+    /// ATA of `from_account.owner` on `underlying_mint`.
+    pub(crate) from_ata: AccountInfo<'info>,
+    /// ATA of `to_account.owner` on `underlying_mint`. May alias `from_ata` on self-transfer.
+    pub(crate) to_ata: AccountInfo<'info>,
+    /// Optional transient store grant allowing the caller to compute with the returned transfer result.
+    pub(crate) result_grant: Option<ResultGrantAccounts<'info>>,
+}
+
+pub(crate) struct ResultGrantAccounts<'info> {
+    pub state: AccountInfo<'info>,
+    pub id: zama_fhe::StoreId,
+}
+
+impl<'info> ResultGrantAccounts<'info> {
+    pub(crate) fn bind(state: Option<&UncheckedAccount<'info>>) -> Result<Option<Self>> {
+        state
+            .map(|state| {
+                let account = fhe::read_state(&state.to_account_info())?;
+                Ok(Self {
+                    state: state.to_account_info(),
+                    id: zama_fhe::Store::new(&account).id(),
+                })
+            })
+            .transpose()
+    }
+}
+
+pub(crate) enum TransferAmountSource<'info> {
+    Attested(zama_host::CoprocessorInputAttestation),
+    StoreSlot {
+        amount_store: AccountInfo<'info>,
+        authority: Option<AccountInfo<'info>>,
+        key: [u8; 32],
+    },
+    Grant {
+        handle: [u8; 32],
+    },
+}
+
+pub(crate) struct TransferOutcome {
+    pub(crate) mint: Pubkey,
+    pub(crate) from_owner: Pubkey,
+    pub(crate) from_token_account: Pubkey,
+    pub(crate) old_from_handle: [u8; 32],
+    pub(crate) new_from_handle: [u8; 32],
+    pub(crate) from_encrypted_store: Pubkey,
+    pub(crate) transferred_handle: [u8; 32],
+    pub(crate) transferred_encrypted_store: Pubkey,
+    pub(crate) to_owner: Pubkey,
+    pub(crate) to_token_account: Pubkey,
+    pub(crate) old_to_handle: [u8; 32],
+    pub(crate) new_to_handle: [u8; 32],
+    pub(crate) to_encrypted_store: Pubkey,
+}
+
+#[inline(never)]
+pub(crate) fn execute_transfer<'info>(
+    accounts: TransferAccounts<'_, 'info>,
+    amount_source: TransferAmountSource<'info>,
+) -> Result<Option<TransferOutcome>> {
+    assert_confidential_mint_shape(accounts.mint)?;
+    let mint_key = accounts.mint.key();
+    let from = accounts.from_account;
+    let to = accounts.to_account;
+    // Every amount source debits `from`. A value spend gate admits the account's own values, so
+    // only this check keeps a stranger from spending another owner's balance.
+    require_keys_eq!(
+        from.owner,
+        accounts.transfer_authority.key(),
+        ConfidentialTokenError::OwnerMismatch
+    );
+
+    if let TransferAmountSource::Attested(amount_attestation) = &amount_source {
+        // EVM `fromExternal` parity for the amount: the attested input must be authored by the
+        // sender (user) and bound to this program (the `msg.sender`/contract analog the host
+        // re-checks against the execution's application). The coprocessor signature over both is
+        // verified in-execution. Stored inputs are gated instead by the token spend gate
+        // and euint64 type check in its instruction handler.
+        assert_amount_attestation_binding(amount_attestation, accounts.transfer_authority.key())?;
+    }
+    require_keys_eq!(from.mint, mint_key, ConfidentialTokenError::MintMismatch);
+    require_keys_eq!(to.mint, mint_key, ConfidentialTokenError::MintMismatch);
+    assert_confidential_token_account_shape(from, mint_key, from.owner)?;
+    assert_confidential_token_account_shape(to, mint_key, to.owner)?;
+    check_underlying_ata_not_frozen(
+        accounts.mint,
+        from.owner,
+        &accounts.underlying_mint,
+        &accounts.from_ata,
+    )?;
+    check_underlying_ata_not_frozen(
+        accounts.mint,
+        to.owner,
+        &accounts.underlying_mint,
+        &accounts.to_ata,
+    )?;
+    let from_key = from.key();
+    let to_key = to.key();
+    let from_owner = from.owner;
+    let to_owner = to.owner;
+    let from_encrypted_store = accounts.from_store.key();
+    let to_encrypted_store = accounts.to_store.key();
+    if from_key == to_key {
+        require!(
+            accounts.result_grant.is_none(),
+            ConfidentialTokenError::ResultGrantMismatch
+        );
+        assert_no_remaining_accounts(accounts.remaining_accounts)?;
+        return Ok(None);
+    }
+
+    let from_balance = fhe::read_state(&accounts.from_store)?;
+    let to_balance = fhe::read_state(&accounts.to_store)?;
+    let old_from_handle = fhe::store_handle(&from_balance, balance_key())?;
+    let old_to_handle = fhe::store_handle(&to_balance, balance_key())?;
+
+    let (new_from_handle, transferred_handle, new_to_handle) = compute_transfer_handles(
+        &accounts,
+        &amount_source,
+        mint_key,
+        &from_balance,
+        &to_balance,
+    )?;
+
+    let transferred_encrypted_store = accounts.from_store.key();
+
+    Ok(Some(TransferOutcome {
+        mint: mint_key,
+        from_owner,
+        from_token_account: from_key,
+        old_from_handle,
+        new_from_handle,
+        from_encrypted_store,
+        transferred_handle,
+        transferred_encrypted_store,
+        to_owner,
+        to_token_account: to_key,
+        old_to_handle,
+        new_to_handle,
+        to_encrypted_store,
+    }))
+}
+
+#[inline(never)]
+fn build_transfer_execution(
+    accounts: &TransferAccounts<'_, '_>,
+    amount_source: &TransferAmountSource<'_>,
+    from_account: &zama_host::EncryptedStore,
+    to_account: &zama_host::EncryptedStore,
+    stored_amount: Option<&zama_host::EncryptedStore>,
+) -> Result<zama_fhe::ReturningFheExecution<zama_fhe::Uint<64>>> {
+    let from_store = Box::new(zama_fhe::Store::new(from_account));
+    let to_store = Box::new(zama_fhe::Store::new(to_account));
+    let from_balance = from_store.get::<zama_fhe::Uint<64>>(balance_key())?;
+    let to_balance = to_store.get::<zama_fhe::Uint<64>>(balance_key())?;
+    let existing_operand = match (amount_source, stored_amount) {
+        (TransferAmountSource::StoreSlot { key, .. }, Some(state)) => {
+            Some(fhe::uint64_operand(state, *key)?)
+        }
+        (TransferAmountSource::Grant { handle }, _) => {
+            // The host checks the handle grant to the sender Store in the shared transient store.
+            Some(zama_fhe::Store::new(from_account).granted(*handle)?)
+        }
+        _ => None,
+    };
+    let mut result_output = from_store.result().allow(accounts.from_account.owner);
+    if accounts.to_account.owner != accounts.from_account.owner {
+        result_output = result_output.allow(accounts.to_account.owner);
+    }
+    if let Some(grant) = &accounts.result_grant {
+        result_output = result_output.allow_transient(grant.id);
+    }
+    let result_output = Box::new(result_output);
+    zama_fhe::FheExecution::build_returning(from_store.id(), |fhe| {
+        let amount = match amount_source {
+            TransferAmountSource::Attested(attestation) => {
+                fhe.verified_input(attestation.clone())?
+            }
+            _ => existing_operand.expect("state or grant operand").into(),
+        };
+        let success = fhe.ge(from_balance, amount)?;
+        let debit = fhe.sub(from_balance, amount)?;
+        let remaining = fhe.if_then_else(success, debit, from_balance)?;
+        let transferred = fhe.sub(from_balance, remaining)?;
+        let credited = fhe.add(to_balance, transferred)?;
+        fhe.output(transferred, *result_output)?;
+        fhe.output(
+            remaining,
+            from_store
+                .set(balance_key())
+                .allow(accounts.from_account.owner),
+        )?;
+        fhe.output(
+            credited,
+            to_store.set(balance_key()).allow(accounts.to_account.owner),
+        )?;
+        Ok(transferred)
+    })
+    .map_err(Into::into)
+}
+
+fn compute_transfer_handles<'info>(
+    accounts: &TransferAccounts<'_, 'info>,
+    amount_source: &TransferAmountSource<'info>,
+    mint_key: Pubkey,
+    from_account: &zama_host::EncryptedStore,
+    to_account: &zama_host::EncryptedStore,
+) -> Result<([u8; 32], [u8; 32], [u8; 32])> {
+    let stored_amount = match amount_source {
+        TransferAmountSource::StoreSlot { amount_store, .. } => {
+            Some(Box::new(fhe::read_state(amount_store)?))
+        }
+        _ => None,
+    };
+    let execution = build_transfer_execution(
+        accounts,
+        amount_source,
+        from_account,
+        to_account,
+        stored_amount.as_deref(),
+    )?;
+    let mut dynamic = vec![accounts.from_store.clone(), accounts.to_store.clone()];
+    let mut authorities = vec![
+        fhe::StoreAuthority::token_account(accounts.from_account),
+        fhe::StoreAuthority::token_account(accounts.to_account),
+    ];
+    let mut add_account = |info: AccountInfo<'info>| {
+        if !dynamic.iter().any(|a| a.key() == info.key()) {
+            dynamic.push(info);
+        }
+    };
+    match amount_source {
+        TransferAmountSource::StoreSlot {
+            amount_store,
+            authority,
+            ..
+        } => {
+            add_account(amount_store.clone());
+            if let Some(authority) = authority {
+                if !authorities.iter().any(|a| a.key() == authority.key()) {
+                    authorities.push(fhe::StoreAuthority::external(authority.clone()));
+                }
+            }
+            if stored_amount
+                .as_ref()
+                .is_some_and(|s| s.authority == accounts.transfer_authority.key())
+            {
+                authorities.push(fhe::StoreAuthority::external(
+                    accounts.transfer_authority.to_account_info(),
+                ));
+            }
+        }
+        TransferAmountSource::Grant { .. } | TransferAmountSource::Attested(_) => {}
+    }
+    if let Some(grant) = &accounts.result_grant {
+        add_account(grant.state.clone());
+    }
+    let resolved =
+        fhe::ExecutionAccountSet::for_execution(execution.execution(), dynamic, authorities)?;
+    let handle = fhe::execute_returning(fhe::Execute {
+        context: fhe::ExecuteContext {
+            payer: accounts.payer,
+            event_authority: accounts.zama_event_authority,
+            transient_store: accounts.transient_store,
+            instructions: accounts.instructions,
+            zama_program: accounts.zama_program,
+            host_config: accounts.host_config,
+            deny_scope_records: fhe::deny_scope_records(
+                accounts.host_config,
+                accounts.remaining_accounts,
+                std::iter::once(token_app(mint_key)).chain(stored_amount.as_ref().map(|s| {
+                    zama_fhe::AppScope {
+                        program: s.program,
+                        scope: s.scope,
+                    }
+                })),
+            )?,
+            system_program: accounts.system_program,
+            hcu_block_meter: accounts.hcu_block_meter.clone(),
+            hcu_trusted_app_record: accounts.hcu_trusted_app_record.clone(),
+        },
+        accounts: &resolved,
+        execution,
+    })?;
+    Ok((
+        fhe::store_handle(&fhe::read_state(&accounts.from_store)?, balance_key())?,
+        handle,
+        fhe::store_handle(&fhe::read_state(&accounts.to_store)?, balance_key())?,
+    ))
+}
+
+/// Re-writes `value` onto a fresh handle of the same amount (`value + 0`) allowed to `allows`,
+/// signed by `authority`: the one-step execution behind `allow_balance_viewers` and
+/// `allow_total_supply_viewers`. Returns the new handle.
+pub(crate) fn rewrite_allowing<'info>(
+    context: fhe::ExecuteContext<'_, 'info>,
+    value: &Account<'info, zama_host::EncryptedStore>,
+    id: (zama_fhe::StoreId, [u8; 32]),
+    authority: fhe::StoreAuthority<'info>,
+    allows: impl IntoIterator<Item = Pubkey>,
+) -> Result<[u8; 32]> {
+    let operand = fhe::uint64_operand(value, id.1)?;
+    let output = fhe::SlotOutput::new(value.to_account_info(), id, &authority, allows)?;
+    let execution = zama_fhe::FheExecution::build(id.0, |builder| {
+        let result = builder.add(operand, zama_fhe::Scalar::<zama_fhe::Uint<64>>::u64(0))?;
+        builder.output(result, output.output())?;
+        Ok(())
+    })?;
+    let accounts =
+        fhe::ExecutionAccountSet::for_execution(&execution, [output.account_info()], [authority])?;
+    fhe::execute(fhe::Execute {
+        context,
+        accounts: &accounts,
+        execution,
+    })?;
+    output.handle()
+}
+
+/// Validates a coprocessor-attested transfer/burn amount (EVM `fromExternal` parity). The host
+/// re-verifies the attestation signature and enforces `contract_address == program` in-execution;
+/// the program binds the attested identities to this transaction: the input must be authored by
+/// `expected_user` (the sender/burner) and bound to this program. The amount handle must be a
+/// confidential balance.
+pub(crate) fn assert_amount_attestation_binding(
+    attestation: &zama_host::CoprocessorInputAttestation,
+    expected_user: Pubkey,
+) -> Result<()> {
+    require!(
+        zama_host::handle_fhe_type(attestation.input_handle) == BALANCE_FHE_TYPE,
+        ConfidentialTokenError::AmountHandleTypeMismatch
+    );
+    require_keys_eq!(
+        Pubkey::new_from_array(attestation.user_address),
+        expected_user,
+        ConfidentialTokenError::AttestationUserMismatch
+    );
+    require_keys_eq!(
+        Pubkey::new_from_array(attestation.contract_address),
+        crate::ID,
+        ConfidentialTokenError::AttestationContractMismatch
+    );
+    Ok(())
+}
+
+/// The token spend gate for an existing amount value — EVM `FHE.isAllowed(amount, msg.sender)`
+/// parity, app-level by design. Computing on a value is admitted by its authority's signature,
+/// so the spender must be that authority (another program's PDA signing through
+/// `invoke_signed`), or own the token account whose values this program signs for. The amount
+/// must be a confidential balance type.
+pub(crate) fn assert_amount_store_spendable(
+    amount_store: &zama_host::EncryptedStore,
+    key: [u8; 32],
+    spender: Pubkey,
+    spender_token_account: Pubkey,
+) -> Result<()> {
+    require!(
+        zama_host::handle_fhe_type(fhe::store_handle(amount_store, key)?) == BALANCE_FHE_TYPE,
+        ConfidentialTokenError::AmountHandleTypeMismatch
+    );
+    require!(
+        amount_store.authority == spender || amount_store.authority == spender_token_account,
+        ConfidentialTokenError::AmountSpendAuthorityMismatch
+    );
+    Ok(())
+}
+
+/// Binds an encrypted value to one exact token state field: this program's application for
+/// `mint`, the controlling PDA, and the field label.
+pub(crate) fn assert_token_value(
+    value: &zama_host::EncryptedStore,
+    mint: Pubkey,
+    authority: Pubkey,
+    label: [u8; 32],
+) -> Result<()> {
+    require!(
+        value.program == crate::ID
+            && value.scope == mint
+            && value.authority == authority
+            && value.get(&label).is_some(),
+        ConfidentialTokenError::TokenEncryptedStoreMismatch
+    );
+    Ok(())
+}
+
+/// Encrypted value account checks for the redeem path: burned-amount handle type and the exact
+/// token state field. The caller separately requires the pending handle to be current and verifies
+/// the KMS certificate for it through `verify_public_decrypt`.
+pub(crate) fn assert_burned_amount_store_account(
+    amount_store: &Account<zama_host::EncryptedStore>,
+    burned_handle: [u8; 32],
+    mint: Pubkey,
+    token_account: Pubkey,
+) -> Result<()> {
+    require!(
+        zama_host::handle_fhe_type(burned_handle) == BALANCE_FHE_TYPE,
+        ConfidentialTokenError::AmountHandleTypeMismatch
+    );
+    assert_token_value(amount_store, mint, token_account, burned_amount_key())
+        .map_err(|_| error!(ConfidentialTokenError::AmountAclMismatch))?;
+    require_keys_eq!(
+        amount_store.key(),
+        encrypted_store_address(mint, token_account).0,
+        ConfidentialTokenError::AmountAclMismatch
+    );
+    Ok(())
+}
+
+/// Encodes a u64 cleartext as the 32-byte big-endian (abi `uint256`) decrypted result
+/// the KMS signs over in the `PublicDecryptVerification` certificate (cert-secp path).
+pub(crate) fn kms_decrypted_result_bytes(cleartext_amount: u64) -> [u8; 32] {
+    let mut decrypted = [0u8; 32];
+    decrypted[24..].copy_from_slice(&cleartext_amount.to_be_bytes());
+    decrypted
+}
+
+pub(crate) fn assert_canonical_vault_token_account(
+    vault_usdc: Pubkey,
+    vault_authority: Pubkey,
+    underlying_mint: Pubkey,
+    token_program: Pubkey,
+) -> Result<()> {
+    require_keys_eq!(
+        vault_usdc,
+        get_associated_token_address_with_program_id(
+            &vault_authority,
+            &underlying_mint,
+            &token_program,
+        ),
+        ConfidentialTokenError::VaultAccountMismatch
+    );
+    Ok(())
+}
+
+/// Accepts the classic token program and extension-free Token-2022 mints. Extension behavior can
+/// change transfer amounts or invoke external programs, so unsupported extensions fail closed.
+pub(crate) fn assert_supported_underlying_mint(
+    mint: &InterfaceAccount<SplMint>,
+    token_program: &Interface<TokenInterface>,
+) -> Result<()> {
+    require_keys_eq!(
+        *mint.to_account_info().owner,
+        token_program.key(),
+        ConfidentialTokenError::UnderlyingTokenProgramMismatch
+    );
+    if token_program.key() == anchor_spl::token_2022::ID {
+        use anchor_spl::token_interface::spl_token_2022::extension::{
+            BaseStateWithExtensions, StateWithExtensions,
+        };
+        let mint_info = mint.to_account_info();
+        let data = mint_info.try_borrow_data()?;
+        let state = StateWithExtensions::<
+            anchor_spl::token_interface::spl_token_2022::state::Mint,
+        >::unpack(&data)
+        .map_err(|_| error!(ConfidentialTokenError::UnsupportedToken2022Extension))?;
+        require!(
+            state
+                .get_extension_types()
+                .map_err(|_| error!(ConfidentialTokenError::UnsupportedToken2022Extension))?
+                .is_empty(),
+            ConfidentialTokenError::UnsupportedToken2022Extension
+        );
+    }
+    Ok(())
+}
+
+/// Validates an underlying token account against the selected token program. Token-2022 ATAs may
+/// carry only `ImmutableOwner`; all amount-affecting or callback extensions are rejected by the
+/// extension-free mint rule above and this account-side fail-closed check.
+pub(crate) fn assert_supported_underlying_token_account(
+    account: &InterfaceAccount<TokenAccount>,
+    token_program: &Interface<TokenInterface>,
+) -> Result<()> {
+    require_keys_eq!(
+        *account.to_account_info().owner,
+        token_program.key(),
+        ConfidentialTokenError::UnderlyingTokenProgramMismatch
+    );
+    require!(
+        account.state != anchor_spl::token_interface::spl_token_2022::state::AccountState::Frozen,
+        ConfidentialTokenError::UnderlyingTokenAccountFrozen
+    );
+    if token_program.key() == anchor_spl::token_2022::ID {
+        use anchor_spl::token_interface::spl_token_2022::extension::{
+            BaseStateWithExtensions, ExtensionType, StateWithExtensions,
+        };
+        let account_info = account.to_account_info();
+        let data = account_info.try_borrow_data()?;
+        let state = StateWithExtensions::<
+            anchor_spl::token_interface::spl_token_2022::state::Account,
+        >::unpack(&data)
+        .map_err(|_| error!(ConfidentialTokenError::UnsupportedToken2022Extension))?;
+        require!(
+            state
+                .get_extension_types()
+                .map_err(|_| error!(ConfidentialTokenError::UnsupportedToken2022Extension))?
+                .iter()
+                .all(|extension| *extension == ExtensionType::ImmutableOwner),
+            ConfidentialTokenError::UnsupportedToken2022Extension
+        );
+    }
+    Ok(())
+}
+
+/// Issuer freeze (V3 `_requireNotBlocked` on the underlying).
+///
+/// `ata` must be the associated token account for `owner` on `mint.underlying_mint`
+/// (`get_associated_token_address_with_program_id`, token program = `underlying_mint.owner`).
+/// Uninitialized at that address (system-owned, empty) → not frozen: Circle/Tether freeze an
+/// existing token account. Confidential transfer and burn use this; wrap and redeem freeze-check
+/// the SPL accounts they move instead. Not the host grant deny-list.
+pub(crate) fn check_underlying_ata_not_frozen(
+    mint: &ConfidentialMint,
+    owner: Pubkey,
+    underlying_mint: &AccountInfo,
+    ata: &AccountInfo,
+) -> Result<()> {
+    require_keys_eq!(
+        underlying_mint.key(),
+        mint.underlying_mint,
+        ConfidentialTokenError::UnderlyingMintMismatch
+    );
+    let token_program = *underlying_mint.owner;
+    require!(
+        token_program == anchor_spl::token::ID || token_program == anchor_spl::token_2022::ID,
+        ConfidentialTokenError::UnderlyingTokenProgramMismatch
+    );
+    require_keys_eq!(
+        ata.key(),
+        get_associated_token_address_with_program_id(&owner, &mint.underlying_mint, &token_program),
+        ConfidentialTokenError::UnderlyingAssociatedAccountMismatch
+    );
+    if ata.owner == &System::id() && ata.data_is_empty() {
+        require!(
+            !ata.executable,
+            ConfidentialTokenError::UnderlyingAssociatedAccountMismatch
+        );
+        return Ok(());
+    }
+    require_keys_eq!(
+        *ata.owner,
+        token_program,
+        ConfidentialTokenError::UnderlyingTokenProgramMismatch
+    );
+    // Classic 165-byte accounts unpack through Token-2022 `StateWithExtensions`.
+    use anchor_spl::token_interface::spl_token_2022::extension::StateWithExtensions;
+    let data = ata.try_borrow_data()?;
+    let state =
+        StateWithExtensions::<anchor_spl::token_interface::spl_token_2022::state::Account>::unpack(
+            &data,
+        )
+        .map_err(|_| error!(ConfidentialTokenError::UnderlyingAssociatedAccountMismatch))?;
+    require_keys_eq!(
+        state.base.mint,
+        mint.underlying_mint,
+        ConfidentialTokenError::UnderlyingMintMismatch
+    );
+    require_keys_eq!(
+        state.base.owner,
+        owner,
+        ConfidentialTokenError::OwnerMismatch
+    );
+    require!(
+        state.base.state
+            != anchor_spl::token_interface::spl_token_2022::state::AccountState::Frozen,
+        ConfidentialTokenError::UnderlyingTokenAccountFrozen
+    );
+    Ok(())
+}
+
+pub(crate) fn assert_confidential_mint_shape(mint: &Account<ConfidentialMint>) -> Result<()> {
+    require!(
+        mint.to_account_info().data_len() == 8 + ConfidentialMint::SPACE,
+        ConfidentialTokenError::MintAccountMismatch
+    );
+    Ok(())
+}
+
+pub(crate) fn assert_confidential_token_account_shape(
+    token_account: &Account<ConfidentialTokenAccount>,
+    mint: Pubkey,
+    owner: Pubkey,
+) -> Result<()> {
+    require!(
+        token_account.to_account_info().data_len() == 8 + ConfidentialTokenAccount::SPACE,
+        ConfidentialTokenError::TokenAccountMismatch
+    );
+    require_keys_eq!(
+        token_account.mint,
+        mint,
+        ConfidentialTokenError::MintMismatch
+    );
+    require_keys_eq!(
+        token_account.owner,
+        owner,
+        ConfidentialTokenError::OwnerMismatch
+    );
+    Ok(())
+}

@@ -1,0 +1,92 @@
+//! Program-specific errors returned by confidential-batcher instructions.
+
+use anchor_lang::prelude::*;
+
+/// Errors returned by the confidential batcher.
+#[error_code]
+pub enum BatcherError {
+    /// The supplied confidential mint does not match the batcher config.
+    #[msg("confidential mint does not match the batcher config")]
+    ConfidentialMintMismatch,
+    /// The supplied vault does not match the batcher config.
+    #[msg("vault does not match the batcher config")]
+    VaultMismatch,
+    /// The supplied batch does not belong to this batcher.
+    #[msg("batch does not belong to this batcher")]
+    BatchBatcherMismatch,
+    /// The previous batch account is required (or wrong) for this open.
+    #[msg("previous batch account missing or not the immediately preceding batch")]
+    PreviousBatchMismatch,
+    /// A new batch cannot open while the previous batch is still pending.
+    #[msg("previous batch is still pending")]
+    PreviousBatchStillPending,
+    /// The instruction requires a pending batch.
+    #[msg("batch is not pending")]
+    BatchNotPending,
+    /// The instruction requires a dispatched batch.
+    #[msg("batch is not dispatched")]
+    BatchNotDispatched,
+    /// The instruction requires a settled batch.
+    #[msg("batch is not settled")]
+    BatchNotSettled,
+    /// Dispatch was attempted before the batch reached its minimum age.
+    #[msg("batch is younger than the minimum batch age")]
+    BatchTooYoung,
+    /// A derived token or encrypted store did not match its canonical address.
+    #[msg("account does not match its canonical derived address")]
+    DerivedAccountMismatch,
+    /// An encrypted store was malformed or not owned by the host.
+    #[msg("encrypted store is invalid")]
+    EncryptedStoreInvalid,
+    /// The batcher produced an invalid FHE execution (internal invariant).
+    #[msg("invalid FHE execution")]
+    InvalidFheExecution,
+    /// The join record's payout was already claimed.
+    #[msg("payout already claimed for this join record")]
+    AlreadyClaimed,
+    /// A batch index computation overflowed.
+    #[msg("batch index overflowed")]
+    BatchIndexOverflow,
+    /// The join confidential mint does not wrap the vault mint the direction
+    /// requires (underlying for deposit batchers, shares for redeem batchers).
+    #[msg("join confidential mint does not wrap the vault mint this direction requires")]
+    JoinMintVaultMismatch,
+    /// The payout confidential mint does not wrap the vault mint the direction
+    /// requires (shares for deposit batchers, underlying for redeem batchers).
+    #[msg("payout confidential mint does not wrap the vault mint this direction requires")]
+    PayoutMintVaultMismatch,
+    /// The batch payout account's balance decreased across the vault phase
+    /// (unreachable; guards the delta computation).
+    #[msg("batch payout balance decreased across the vault phase")]
+    PayoutBalanceUnderflow,
+    /// Quitting is allowed only while a batch is pending or refunding after a cancelled dispatch.
+    #[msg("batch does not accept refunds")]
+    BatchNotRefundable,
+    /// A dispatched batch can be cancelled only once its settle deadline has passed.
+    #[msg("settle deadline has not passed; the batch can still settle")]
+    SettleDeadlineNotReached,
+    /// A dispatched batch cannot settle once its settle deadline has passed.
+    #[msg("settle deadline has passed; cancel the dispatch instead")]
+    SettleDeadlinePassed,
+    /// Authority funding is reclaimable only once the batch is settled, canceled or refunding.
+    #[msg("batch is still live; authority funding is reclaimable after settle, cancel or refund")]
+    BatchStillLive,
+    /// Reclaiming authority funding is reserved to the join mint's wrapper authority.
+    #[msg("reclaim authority does not match the join confidential mint authority")]
+    ReclaimAuthorityMismatch,
+    /// A join record closes only after its payout is claimed or its batch is canceled.
+    #[msg("join record is still live; close it after claiming or once the batch is canceled")]
+    JoinRecordStillLive,
+    /// The supplied index must open the next batch.
+    #[msg("batch index does not match the next batch index")]
+    BatchIndexMismatch,
+    /// The remaining accounts must be exactly the deny records the instruction's executions need.
+    #[msg("remaining accounts do not match the deny records this instruction needs")]
+    DenyRecordsMismatch,
+    /// The minimum batch age exceeds `MAX_MIN_BATCH_AGE_SECS`.
+    #[msg("minimum batch age exceeds the maximum")]
+    InvalidMinBatchAge,
+    /// The settle deadline is zero or exceeds `MAX_SETTLE_DEADLINE_SECS`.
+    #[msg("settle deadline is zero or exceeds the maximum")]
+    InvalidSettleDeadline,
+}

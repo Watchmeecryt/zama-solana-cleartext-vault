@@ -1,0 +1,233 @@
+//! Account layouts, PDA helpers, encrypted-value labels, and the payout math.
+//!
+//! Public API surface: off-chain callers deriving batcher PDAs — `runtime-tests`' `batcher_mollusk`
+//! fixtures. TypeScript clients are generated from the Anchor IDL.
+
+use anchor_lang::prelude::*;
+
+use crate::constants::*;
+
+/// Which way through the vault a batcher instance moves value. Direction lives
+/// on the `Batcher` config — one instance per direction, mirroring the EVM's
+/// two batcher deployments — so a pending deposit batch never blocks a redeem
+/// batch, and every batch inherits its batcher's direction.
+#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BatchDirection {
+    /// Users join with confidential underlying; claims pay confidential shares.
+    Deposit,
+    /// Users join with confidential shares; claims pay confidential underlying.
+    Redeem,
+}
+
+/// Batcher config wiring a join confidential mint, a payout confidential mint,
+/// and one public vault together for one direction.
+#[account]
+#[derive(InitSpace)]
+pub struct Batcher {
+    /// Direction of this batcher instance.
+    pub direction: BatchDirection,
+    /// Confidential mint users join batches with. Wraps the vault's underlying
+    /// mint for deposit batchers, the vault's share mint for redeem batchers.
+    pub join_confidential_mint: Pubkey,
+    /// Confidential mint claims pay out in. Wraps the vault's share mint for
+    /// deposit batchers, the vault's underlying mint for redeem batchers.
+    pub payout_confidential_mint: Pubkey,
+    /// Public `demo_vault::Vault` the batcher fronts.
+    pub vault: Pubkey,
+    /// Minimum seconds a batch must stay open before dispatch.
+    pub min_batch_age_secs: u64,
+    /// Seconds after dispatch during which only `settle` may finish the batch; from then on only
+    /// `cancel_dispatch` may, and anyone can call it.
+    pub settle_deadline_secs: u64,
+    /// Index the next `open_batch` creates.
+    pub next_batch_index: u64,
+}
+
+/// Lifecycle of a batch.
+#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BatchStatus {
+    /// Open for joins and quits.
+    Pending,
+    /// Total burned; awaiting the KMS certificate.
+    Dispatched,
+    /// Payout received; claims open.
+    Settled,
+    /// Certified total was zero; nothing to claim.
+    Canceled,
+    /// Dispatch burn was cancelled; existing users may only retrieve their recorded joins.
+    Refunding,
+}
+
+/// One batch: its own confidential token account (so the revealed total is
+/// exactly this batch's sum), lifecycle status, and the public settle results.
+#[account]
+#[derive(InitSpace)]
+pub struct Batch {
+    /// Batcher config this batch belongs to (carries the direction).
+    pub batcher: Pubkey,
+    /// Zero-based index within the batcher.
+    pub index: u64,
+    /// Lifecycle status.
+    pub status: BatchStatus,
+    /// Unix time the batch opened at; dispatch requires `min_batch_age_secs` past.
+    pub opened_at: i64,
+    /// Unix time the batch was dispatched at (zero before dispatch).
+    pub dispatched_at: i64,
+    /// Number of join calls routed into this batch.
+    pub join_count: u64,
+    /// Bump of the per-batch authority PDA.
+    pub authority_bump: u8,
+    /// PDA bump for `(batcher, index)`.
+    pub bump: u8,
+    /// Created-public handle of the burned batch total (set at dispatch).
+    pub burned_total_handle: [u8; 32],
+    /// KMS-certified batch join total (set at settle; public by design).
+    pub total_joined: u64,
+    /// Payout units the vault phase produced for the batch total (set at settle).
+    pub payout_received: u64,
+    /// Informational rate `payout_received * RATE_SCALE / total_joined`,
+    /// saturating at u64::MAX (settle). Claims use exact proportional division
+    /// instead — never this field.
+    pub payout_rate: u64,
+}
+
+impl Batch {
+    /// Unix time from which a dispatched batch can no longer settle and anyone may cancel it.
+    pub fn settle_deadline(&self, batcher: &Batcher) -> i64 {
+        // Bounded by `MAX_SETTLE_DEADLINE_SECS` at initialization, so the cast cannot wrap.
+        self.dispatched_at
+            .saturating_add(batcher.settle_deadline_secs as i64)
+    }
+}
+
+/// Per-(batch, user) join record. The encrypted amount itself lives in the batcher-owned
+/// `EncryptedStore` account at `joined_encrypted_store`: the user may decrypt their pending
+/// amount, and the batch authority computes refunds and claims from it by signature.
+#[account]
+#[derive(InitSpace)]
+pub struct JoinRecord {
+    /// Batch this record belongs to.
+    pub batch: Pubkey,
+    /// Joining user.
+    pub user: Pubkey,
+    /// Whether the user's payout was claimed.
+    pub claimed: bool,
+    /// PDA bump for `(batch, user)`.
+    pub bump: u8,
+}
+
+/// Returns the batch PDA for a batcher and index.
+pub fn batch_address(batcher: Pubkey, index: u64) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[BATCH_SEED, batcher.as_ref(), &index.to_le_bytes()],
+        &crate::ID,
+    )
+}
+
+/// Returns the per-batch authority PDA that owns the batch's token accounts.
+pub fn batch_authority_address(batch: Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[BATCH_AUTHORITY_SEED, batch.as_ref()], &crate::ID)
+}
+
+/// Returns the join record PDA for a batch and user.
+pub fn join_record_address(batch: Pubkey, user: Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[JOIN_RECORD_SEED, batch.as_ref(), user.as_ref()],
+        &crate::ID,
+    )
+}
+
+/// Returns the batch's plain SPL account in the join mint's underlying.
+pub fn batch_join_underlying_address(batch: Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[BATCH_JOIN_UNDERLYING_SEED, batch.as_ref()], &crate::ID)
+}
+
+/// Returns the batch's plain SPL account in the payout mint's underlying.
+pub fn batch_payout_underlying_address(batch: Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[BATCH_PAYOUT_UNDERLYING_SEED, batch.as_ref()], &crate::ID)
+}
+
+/// Computes the informational payout rate of a settled batch, rounded DOWN
+/// and saturating at u64::MAX:
+/// `rate = payout_received * RATE_SCALE / total_joined`.
+///
+/// Event-facing only — claims never multiply by it (they use exact
+/// proportional division), so a redeem batch whose per-unit payout exceeds
+/// the u64 rate range (extreme share price) must not fail settle over a
+/// display number. `total_joined` must be non-zero (zero-total batches cancel
+/// instead).
+pub fn payout_rate(payout_received: u64, total_joined: u64) -> Result<u64> {
+    let rate = ((payout_received as u128) * (RATE_SCALE as u128))
+        .checked_div(total_joined as u128)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    Ok(u64::try_from(rate).unwrap_or(u64::MAX))
+}
+
+pub fn join_store_id(batch: Pubkey, record: Pubkey) -> zama_fhe::StoreId {
+    zama_fhe::StoreId::new(crate::ID, record, batch)
+}
+
+/// Join-store key of the user's encrypted joined amount.
+#[constant]
+pub const JOINED_AMOUNT_KEY: [u8; 32] = *b"joined_amount___________________";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cleartext mirror of the claim MulDiv: the exact proportional floor
+    /// `joined * payout_received / total_joined`.
+    fn claim_payout(joined: u64, payout_received: u64, total_joined: u64) -> u64 {
+        ((joined as u128) * (payout_received as u128) / (total_joined as u128)) as u64
+    }
+
+    #[test]
+    fn one_to_one_payout_rate_is_the_scale() {
+        assert_eq!(payout_rate(1_000, 1_000).unwrap(), RATE_SCALE);
+    }
+
+    #[test]
+    fn rate_rounds_down() {
+        // 2 payout units for 3 joined: rate = 2 * 1e9 / 3 = 666_666_666 (floor).
+        assert_eq!(payout_rate(2, 3).unwrap(), 666_666_666);
+    }
+
+    #[test]
+    fn rate_saturates_instead_of_failing_settle() {
+        // A redeem batch of 1 share paying out u64::MAX underlying: the true
+        // rate is above u64; the informational field saturates.
+        assert_eq!(payout_rate(u64::MAX, 1).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn claims_never_exceed_received_payout() {
+        // Adversarially rounded batches, including the u64-scale case of
+        // fhevm-internal#1774: sum(floor(joined_i * payout / total)) <= payout.
+        let cases: &[(&[u64], u64)] = &[
+            (&[300, 500], 799),
+            (&[1, 1, 1], 2),
+            (&[7, 11, 13], 17),
+            (&[u64::MAX / 2, u64::MAX / 2 - 100], u64::MAX / 3),
+            (&[u64::MAX / 3, u64::MAX / 3, u64::MAX / 3], u64::MAX - 5),
+        ];
+        for (joins, payout) in cases {
+            let total: u64 = joins
+                .iter()
+                .copied()
+                .fold(0, |acc, j| acc.checked_add(j).unwrap());
+            let distributed: u128 = joins
+                .iter()
+                .map(|joined| claim_payout(*joined, *payout, total) as u128)
+                .sum();
+            assert!(
+                distributed <= *payout as u128,
+                "distributed {distributed} > payout {payout} for joins {joins:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_total_rate_is_rejected() {
+        assert!(payout_rate(10, 0).is_err());
+    }
+}

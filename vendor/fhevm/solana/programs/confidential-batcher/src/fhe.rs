@@ -1,0 +1,73 @@
+//! Batcher FHE execution under each JoinRecord authority.
+
+use crate::errors::BatcherError;
+use anchor_lang::prelude::*;
+
+pub(crate) fn read_state(info: &AccountInfo) -> Result<zama_host::EncryptedStore> {
+    require_keys_eq!(
+        *info.owner,
+        zama_host::ID,
+        BatcherError::EncryptedStoreInvalid
+    );
+    let state = zama_host::EncryptedStore::try_deserialize(&mut &info.try_borrow_data()?[..])?;
+    require_keys_eq!(
+        info.key(),
+        state.canonical_address().0,
+        BatcherError::DerivedAccountMismatch
+    );
+    Ok(state)
+}
+
+pub(crate) struct JoinExecute<'a, 'info> {
+    pub batch: Pubkey,
+    pub user: Pubkey,
+    pub bump: u8,
+    pub record: AccountInfo<'info>,
+    pub payer: AccountInfo<'info>,
+    pub host_config: AccountInfo<'info>,
+    pub event_authority: AccountInfo<'info>,
+    pub transient_store: AccountInfo<'info>,
+    pub instructions: AccountInfo<'info>,
+    pub program: AccountInfo<'info>,
+    pub system_program: AccountInfo<'info>,
+    pub deny_records: &'a [AccountInfo<'info>],
+    pub hcu_block_meter: Option<AccountInfo<'info>>,
+    pub hcu_trusted_app_record: Option<AccountInfo<'info>>,
+}
+
+impl<'info> JoinExecute<'_, 'info> {
+    pub(crate) fn invoke(
+        self,
+        execution: zama_fhe::ReturningFheExecution<zama_fhe::Uint<64>>,
+        dynamic: Vec<AccountInfo<'info>>,
+    ) -> Result<[u8; 32]> {
+        let resolved = execution
+            .execution()
+            .resolve_accounts(dynamic, [self.record.clone()])?;
+        let bump = [self.bump];
+        let seeds: &[&[u8]] = &[
+            crate::constants::JOIN_RECORD_SEED,
+            self.batch.as_ref(),
+            self.user.as_ref(),
+            &bump,
+        ];
+        execution.invoke(
+            zama_fhe::ExecutionCpiAccounts {
+                payer: self.payer,
+                authority: self.record,
+                host_config: self.host_config,
+                deny_scope_records: self.deny_records.to_vec(),
+                system_program: self.system_program,
+                hcu_block_meter: self.hcu_block_meter,
+                hcu_trusted_app_record: self.hcu_trusted_app_record,
+                rand_nonce: None,
+                event_authority: self.event_authority,
+                transient_store: self.transient_store,
+                instructions: self.instructions,
+                program: self.program,
+            },
+            &resolved,
+            &[seeds],
+        )
+    }
+}

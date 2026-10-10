@@ -1,0 +1,1064 @@
+//! Host admin surface: `initialize_host_config`, pausers and pause flags, the `HostAdmin` setters (unpause,
+//! grant-deny, admin transfer, EIP-712 domain) and the preview-only `close_owned_accounts`.
+//!
+//! Split out of `host_mollusk.rs` so that file does not keep growing. These tests only
+//! touch `HostConfig` through the admin account contexts; they do not share the
+//! `FheExecutionFixture` harness.
+
+use anchor_lang::solana_program::bpf_loader_upgradeable;
+use anchor_lang::{prelude::system_program, InstructionData};
+use delegator_vault as vault;
+use mollusk_svm::result::Check;
+use solana_sdk::{
+    account::Account,
+    instruction::Instruction,
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+};
+use zama_host::{self as host, errors::ZamaHostError};
+use zama_solana_test_kit::{
+    account_is_system_owned_and_empty, anchor_error_check, anchor_framework_error_check, anchor_ix,
+    event_authority, funded_system_account, paused_host_config, program_data_account,
+    system_account, writable, Ctx,
+};
+
+mod host_fixtures;
+use host_fixtures::{
+    host_config_account, host_program_account, mollusk_execute_context, read_host_config,
+    vault_and_host_svm,
+};
+
+fn custom_error(error: ZamaHostError) -> Check<'static> {
+    anchor_error_check(error as u32)
+}
+
+fn program_owned_account() -> Account {
+    Account {
+        lamports: 1_000_000,
+        data: vec![],
+        owner: host::id(),
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+// ---- initialize_host_config ----
+
+/// Args that initialize a config with the given coprocessor signer set + threshold, valid in
+/// every other respect. Callers vary only the set/threshold to exercise the registration
+/// invariants.
+fn init_args(signers: Vec<[u8; 20]>, threshold: u8) -> host::InitializeHostConfigArgs {
+    host::InitializeHostConfigArgs {
+        chain_id: host::SOLANA_POC_CHAIN_ID,
+        gateway_chain_id: 0,
+        input_verification_contract: [0xCDu8; 20],
+        coprocessor_signers: signers,
+        coprocessor_threshold: threshold,
+        decryption_contract: [0u8; 20],
+        grant_deny_list_enabled: false,
+    }
+}
+
+struct InitializeHostConfig {
+    payer: Pubkey,
+    admin: Pubkey,
+    host_config: Pubkey,
+    program_data: Pubkey,
+    context: mollusk_svm::MolluskContext<std::collections::HashMap<Pubkey, Account>>,
+}
+
+impl InitializeHostConfig {
+    /// The runtime an operator sees: the admin is the program's upgrade authority.
+    fn new() -> Self {
+        let admin = Pubkey::new_unique();
+        Self::build(admin, Some(admin))
+    }
+
+    /// A runtime whose `ProgramData` names `upgrade_authority`, which is not the admin.
+    fn with_upgrade_authority(upgrade_authority: Option<Pubkey>) -> Self {
+        Self::build(Pubkey::new_unique(), upgrade_authority)
+    }
+
+    fn build(admin: Pubkey, upgrade_authority: Option<Pubkey>) -> Self {
+        let payer = Pubkey::new_unique();
+        let (host_config, _) = host::host_config_address();
+        let (program_data, program_data_acct) = program_data_account(upgrade_authority);
+        let context = mollusk_execute_context(
+            payer,
+            vec![
+                (host_config, system_account(0)),
+                (host::rand_nonce_address().0, system_account(0)),
+                (program_data, program_data_acct),
+            ],
+        );
+        Self {
+            payer,
+            admin,
+            host_config,
+            program_data,
+            context,
+        }
+    }
+
+    fn ix(&self, args: host::InitializeHostConfigArgs) -> Instruction {
+        anchor_ix(
+            host::id(),
+            host::accounts::InitializeHostConfig {
+                payer: self.payer,
+                admin: self.admin,
+                program_data: self.program_data,
+                host_config: self.host_config,
+                rand_nonce: host::rand_nonce_address().0,
+                system_program: system_program::ID,
+                event_authority: event_authority(host::id()),
+                program: host::id(),
+            },
+            host::instruction::InitializeHostConfig { args },
+        )
+    }
+
+    fn run(&self, ix: &Instruction, check: Check) {
+        self.context.process_and_validate_instruction(ix, &[check]);
+    }
+
+    fn config(&self) -> host::HostConfig {
+        read_host_config(&self.context, self.host_config).expect("config")
+    }
+}
+
+#[test]
+fn mollusk_initialize_host_config_defaults_block_cap_to_unrestricted() {
+    // A freshly initialized config ships unrestricted (u64::MAX), not banned (0).
+    let init = InitializeHostConfig::new();
+    init.run(&init.ix(init_args(vec![[0x11u8; 20]], 1)), Check::success());
+    assert_eq!(init.config().hcu_block_cap_per_app, u64::MAX);
+    // The rand nonce is created with the config, at zero.
+    let rand_nonce: host::RandNonce =
+        zama_solana_test_kit::read_account(&init.context, host::rand_nonce_address().0);
+    assert_eq!(rand_nonce.nonce, 0);
+}
+
+#[test]
+fn mollusk_initialize_host_config_stores_registered_signer_set_and_threshold() {
+    // A valid n-of-m set round-trips into the stored config: distinct signers packed, count and
+    // threshold recorded.
+    let init = InitializeHostConfig::new();
+    let signers = vec![[0x11u8; 20], [0x22u8; 20], [0x33u8; 20]];
+    init.run(&init.ix(init_args(signers.clone(), 2)), Check::success());
+    let config = init.config();
+    assert_eq!(config.coprocessor_signer_count, 3);
+    assert_eq!(config.coprocessor_threshold, 2);
+    assert_eq!(config.active_coprocessor_signers(), signers.as_slice());
+}
+
+#[test]
+fn mollusk_initialize_host_config_rejects_invalid_coprocessor_sets() {
+    let cases: [(&str, Vec<[u8; 20]>, u8, ZamaHostError); 6] = [
+        // A duplicate would silently raise the effective quorum (distinct-signer counting).
+        (
+            "duplicate signer",
+            vec![[0x11u8; 20], [0x11u8; 20]],
+            1,
+            ZamaHostError::DuplicateCoprocessorSigner,
+        ),
+        // threshold 3 > 2 signers: unsatisfiable.
+        (
+            "threshold above count",
+            vec![[0x11u8; 20], [0x22u8; 20]],
+            3,
+            ZamaHostError::InvalidCoprocessorThreshold,
+        ),
+        (
+            "zero threshold",
+            vec![[0x11u8; 20]],
+            0,
+            ZamaHostError::InvalidCoprocessorThreshold,
+        ),
+        (
+            "empty set",
+            vec![],
+            1,
+            ZamaHostError::EmptyCoprocessorSignerSet,
+        ),
+        (
+            "zero signer",
+            vec![[0u8; 20]],
+            1,
+            ZamaHostError::ZeroCoprocessorSigner,
+        ),
+        (
+            "too many signers",
+            (1..=9).map(|i| [i; 20]).collect(),
+            1,
+            ZamaHostError::TooManyCoprocessorSigners,
+        ),
+    ];
+    for (name, signers, threshold, error) in cases {
+        let init = InitializeHostConfig::new();
+        init.run(&init.ix(init_args(signers, threshold)), custom_error(error));
+        assert!(
+            read_host_config(&init.context, init.host_config).is_none(),
+            "{name}: config was created"
+        );
+    }
+}
+
+#[test]
+fn mollusk_initialize_host_config_rejects_admin_who_is_not_the_upgrade_authority() {
+    let init = InitializeHostConfig::with_upgrade_authority(Some(Pubkey::new_unique()));
+    init.run(
+        &init.ix(init_args(vec![[0x11u8; 20]], 1)),
+        custom_error(ZamaHostError::HostConfigAdminMismatch),
+    );
+}
+
+#[test]
+fn mollusk_initialize_host_config_rejects_finalized_program() {
+    let init = InitializeHostConfig::with_upgrade_authority(None);
+    init.run(
+        &init.ix(init_args(vec![[0x11u8; 20]], 1)),
+        custom_error(ZamaHostError::HostConfigAdminMismatch),
+    );
+}
+
+#[test]
+fn mollusk_initialize_host_config_rejects_unsigned_admin() {
+    let init = InitializeHostConfig::new();
+    let mut ix = init.ix(init_args(vec![[0x11u8; 20]], 1));
+    for meta in ix.accounts.iter_mut() {
+        if meta.pubkey == init.admin {
+            meta.is_signer = false;
+        }
+    }
+    init.run(
+        &ix,
+        anchor_framework_error_check(anchor_lang::error::ErrorCode::AccountNotSigner),
+    );
+}
+
+#[test]
+fn mollusk_initialize_host_config_rejects_wrong_program_data_address() {
+    let init = InitializeHostConfig::new();
+    let fake = Pubkey::new_unique();
+    let program_data_acct = init
+        .context
+        .account_store
+        .borrow()
+        .get(&init.program_data)
+        .cloned()
+        .expect("program data");
+    init.context
+        .account_store
+        .borrow_mut()
+        .insert(fake, program_data_acct);
+    let mut ix = init.ix(init_args(vec![[0x11u8; 20]], 1));
+    for meta in ix.accounts.iter_mut() {
+        if meta.pubkey == init.program_data {
+            meta.pubkey = fake;
+        }
+    }
+    init.run(
+        &ix,
+        anchor_framework_error_check(anchor_lang::error::ErrorCode::ConstraintAddress),
+    );
+}
+
+// ---- HostAdmin setters ----
+
+/// A `HostAdmin`-context instruction; the payload names the setter at the call site.
+fn host_admin_ix(admin: Pubkey, host_config: Pubkey, data: impl InstructionData) -> Instruction {
+    anchor_ix(
+        host::id(),
+        host::accounts::HostAdmin {
+            admin,
+            host_config,
+            event_authority: event_authority(host::id()),
+            program: host::id(),
+        },
+        data,
+    )
+}
+
+fn set_admin_ix(admin: Pubkey, host_config: Pubkey, new_admin: Pubkey) -> Instruction {
+    anchor_ix(
+        host::id(),
+        host::accounts::SetAdmin {
+            admin,
+            host_config,
+            new_admin,
+            event_authority: event_authority(host::id()),
+            program: host::id(),
+        },
+        host::instruction::SetAdmin { new_admin },
+    )
+}
+
+// ---- pausers ----
+
+fn set_pauser_ix(admin: Pubkey, host_config: Pubkey, pauser: Pubkey, enabled: bool) -> Instruction {
+    anchor_ix(
+        host::id(),
+        host::accounts::SetPauser {
+            payer: admin,
+            admin,
+            host_config,
+            pauser_record: host::pauser_address(pauser).0,
+            system_program: system_program::ID,
+            event_authority: event_authority(host::id()),
+            program: host::id(),
+        },
+        host::instruction::SetPauser { pauser, enabled },
+    )
+}
+
+fn pause_ix(pauser: Pubkey, host_config: Pubkey, areas: host::PauseFlags) -> Instruction {
+    anchor_ix(
+        host::id(),
+        host::accounts::Pause {
+            pauser,
+            pauser_record: host::pauser_address(pauser).0,
+            host_config,
+            event_authority: event_authority(host::id()),
+            program: host::id(),
+        },
+        host::instruction::Pause { areas },
+    )
+}
+
+fn paused(context: &Ctx, host_config: Pubkey) -> host::PauseFlags {
+    read_host_config(context, host_config)
+        .expect("config")
+        .paused
+}
+
+fn pauser_record(context: &Ctx, pauser: Pubkey) -> host::PauserRecord {
+    let store = context.account_store.borrow();
+    let account = &store[&host::pauser_address(pauser).0];
+    <host::PauserRecord as anchor_lang::AccountDeserialize>::try_deserialize(
+        &mut account.data.as_slice(),
+    )
+    .expect("pauser record")
+}
+
+const EXECUTION: host::PauseFlags = host::PauseFlags {
+    execution: true,
+    verified_inputs: false,
+    acl_writes: false,
+};
+
+#[test]
+fn mollusk_admin_grants_and_withdraws_a_pauser() {
+    let admin = Pubkey::new_unique();
+    let pauser = Pubkey::new_unique();
+    let (host_config, account) = host_config_account(admin);
+    let context = mollusk_execute_context(admin, vec![(host_config, account)]);
+    context.process_and_validate_instruction(
+        &set_pauser_ix(admin, host_config, pauser, true),
+        &[Check::success()],
+    );
+    assert!(pauser_record(&context, pauser).enabled);
+    assert_eq!(pauser_record(&context, pauser).pauser, pauser);
+
+    context.process_and_validate_instruction(
+        &set_pauser_ix(admin, host_config, pauser, false),
+        &[Check::success()],
+    );
+    assert!(!pauser_record(&context, pauser).enabled);
+}
+
+#[test]
+fn mollusk_set_pauser_rejects_another_pausers_record() {
+    let admin = Pubkey::new_unique();
+    let pauser = Pubkey::new_unique();
+    let (host_config, account) = host_config_account(admin);
+    let context = mollusk_execute_context(admin, vec![(host_config, account)]);
+
+    let mut ix = set_pauser_ix(admin, host_config, pauser, true);
+    let record_meta = ix
+        .accounts
+        .iter_mut()
+        .find(|meta| meta.pubkey == host::pauser_address(pauser).0)
+        .expect("record account");
+    record_meta.pubkey = host::pauser_address(Pubkey::new_unique()).0;
+    context.process_and_validate_instruction(
+        &ix,
+        &[anchor_framework_error_check(
+            anchor_lang::error::ErrorCode::ConstraintSeeds,
+        )],
+    );
+}
+
+#[test]
+fn mollusk_set_pauser_creates_its_record_at_an_address_prefunded_below_rent() {
+    // A lamport sent to the record address before it exists must not block the admin.
+    let admin = Pubkey::new_unique();
+    let pauser = Pubkey::new_unique();
+    let (host_config, account) = host_config_account(admin);
+    let context = mollusk_execute_context(
+        admin,
+        vec![
+            (host_config, account),
+            (pauser, funded_system_account()),
+            (host::pauser_address(pauser).0, system_account(1)),
+        ],
+    );
+
+    context.process_and_validate_instruction(
+        &set_pauser_ix(admin, host_config, pauser, true),
+        &[Check::success()],
+    );
+    context.process_and_validate_instruction(
+        &pause_ix(pauser, host_config, EXECUTION),
+        &[Check::success()],
+    );
+    assert_eq!(paused(&context, host_config), EXECUTION);
+}
+
+#[test]
+fn mollusk_withdrawing_an_absent_pauser_writes_a_disabled_record() {
+    // Withdrawing a key that was never a pauser changes nothing, but the record is created anyway.
+    // It must name its pauser and grant nothing, and the next real grant must still apply.
+    let admin = Pubkey::new_unique();
+    let pauser = Pubkey::new_unique();
+    let (host_config, account) = host_config_account(admin);
+    let context = mollusk_execute_context(
+        admin,
+        vec![(host_config, account), (pauser, funded_system_account())],
+    );
+    context.process_and_validate_instruction(
+        &set_pauser_ix(admin, host_config, pauser, false),
+        &[Check::success()],
+    );
+    let record = pauser_record(&context, pauser);
+    assert_eq!((record.pauser, record.enabled), (pauser, false));
+    context.process_and_validate_instruction(
+        &pause_ix(pauser, host_config, EXECUTION),
+        &[custom_error(ZamaHostError::NotPauser)],
+    );
+
+    context.process_and_validate_instruction(
+        &set_pauser_ix(admin, host_config, pauser, true),
+        &[Check::success()],
+    );
+    context.process_and_validate_instruction(
+        &pause_ix(pauser, host_config, EXECUTION),
+        &[Check::success()],
+    );
+    assert_eq!(paused(&context, host_config), EXECUTION);
+}
+
+#[test]
+fn mollusk_only_the_admin_sets_pausers() {
+    let admin = Pubkey::new_unique();
+    let stranger = Pubkey::new_unique();
+    let (host_config, account) = host_config_account(admin);
+    let context = mollusk_execute_context(stranger, vec![(host_config, account)]);
+
+    context.process_and_validate_instruction(
+        &set_pauser_ix(stranger, host_config, stranger, true),
+        &[custom_error(ZamaHostError::HostConfigAdminMismatch)],
+    );
+}
+
+/// A wallet pauser pauses at the top level.
+#[test]
+fn mollusk_a_pauser_pauses_and_only_the_admin_unpauses() {
+    let admin = Pubkey::new_unique();
+    let pauser = Keypair::new().pubkey();
+    let (host_config, account) = host_config_account(admin);
+    let context = mollusk_execute_context(
+        admin,
+        vec![
+            (host_config, account),
+            (pauser, funded_system_account()),
+            zama_solana_test_kit::pauser_record_account(pauser, true),
+        ],
+    );
+
+    context.process_and_validate_instruction(
+        &pause_ix(pauser, host_config, host::PauseFlags::ALL),
+        &[Check::success()],
+    );
+    assert_eq!(paused(&context, host_config), host::PauseFlags::ALL);
+
+    // The pauser cannot clear a flag.
+    context.process_and_validate_instruction(
+        &host_admin_ix(
+            pauser,
+            host_config,
+            host::instruction::Unpause { areas: EXECUTION },
+        ),
+        &[custom_error(ZamaHostError::HostConfigAdminMismatch)],
+    );
+
+    // The admin clears only the areas it names.
+    context.process_and_validate_instruction(
+        &host_admin_ix(
+            admin,
+            host_config,
+            host::instruction::Unpause { areas: EXECUTION },
+        ),
+        &[Check::success()],
+    );
+    assert_eq!(
+        paused(&context, host_config),
+        host::PauseFlags {
+            execution: false,
+            ..host::PauseFlags::ALL
+        }
+    );
+}
+
+/// A pause already in force does not stop a pauser from pausing the remaining area, so only
+/// resuming needs the admin.
+#[test]
+fn mollusk_a_pauser_pauses_an_area_while_the_others_are_paused() {
+    let areas = [
+        host::PauseFlags {
+            execution: true,
+            ..host::PauseFlags::default()
+        },
+        host::PauseFlags {
+            verified_inputs: true,
+            ..host::PauseFlags::default()
+        },
+        host::PauseFlags {
+            acl_writes: true,
+            ..host::PauseFlags::default()
+        },
+    ];
+    for area in areas {
+        let others = host::PauseFlags {
+            execution: !area.execution,
+            verified_inputs: !area.verified_inputs,
+            acl_writes: !area.acl_writes,
+        };
+        let admin = Pubkey::new_unique();
+        let pauser = Keypair::new().pubkey();
+        let (host_config, account) = host_config_account(admin);
+        let context = mollusk_execute_context(
+            admin,
+            vec![
+                (host_config, paused_host_config(&account, others)),
+                (pauser, funded_system_account()),
+                zama_solana_test_kit::pauser_record_account(pauser, true),
+            ],
+        );
+
+        context.process_and_validate_instruction(
+            &pause_ix(pauser, host_config, area),
+            &[Check::success()],
+        );
+        assert_eq!(paused(&context, host_config), host::PauseFlags::ALL);
+    }
+}
+
+/// Admin setters are never paused (DD-058): with every area paused, the admin still withdraws a
+/// pauser and hands the admin role over.
+#[test]
+fn mollusk_the_admin_sets_pausers_and_hands_over_while_every_area_is_paused() {
+    let admin = Pubkey::new_unique();
+    let pauser = Pubkey::new_unique();
+    let (new_admin, _) = Pubkey::find_program_address(&[b"new-admin"], &host::id());
+    let (host_config, account) = host_config_account(admin);
+    let context = mollusk_execute_context(
+        admin,
+        vec![
+            (
+                host_config,
+                paused_host_config(&account, host::PauseFlags::ALL),
+            ),
+            (new_admin, program_owned_account()),
+        ],
+    );
+
+    for setter in [
+        set_pauser_ix(admin, host_config, pauser, true),
+        set_pauser_ix(admin, host_config, pauser, false),
+        set_admin_ix(admin, host_config, new_admin),
+    ] {
+        context.process_and_validate_instruction(&setter, &[Check::success()]);
+    }
+    let config = read_host_config(&context, host_config).expect("config");
+    assert_eq!(config.admin, new_admin);
+    assert_eq!(config.paused, host::PauseFlags::ALL);
+}
+
+fn vault_context(accounts: Vec<(Pubkey, Account)>) -> Ctx {
+    let mollusk = vault_and_host_svm();
+    let mut store: std::collections::HashMap<Pubkey, Account> = accounts.into_iter().collect();
+    store.insert(host::id(), host_program_account());
+    mollusk.with_context(store)
+}
+
+/// A program the pauser calls cannot pause the host in the pauser's name. `check_cpi_return`
+/// forwards every account with its signer flag, as a malicious program would, so the wallet's
+/// signature reaches the host and only the top-level rule stops the pause.
+#[test]
+fn mollusk_a_wallet_pause_forwarded_through_another_program_is_rejected() {
+    let admin = Pubkey::new_unique();
+    let pauser = Keypair::new().pubkey();
+    let (host_config, account) = host_config_account(admin);
+    let context = vault_context(vec![
+        (host_config, account),
+        (pauser, funded_system_account()),
+        zama_solana_test_kit::pauser_record_account(pauser, true),
+    ]);
+    let pause = pause_ix(pauser, host_config, EXECUTION);
+    let mut forwarded = anchor_ix(
+        vault::id(),
+        vault::accounts::CheckCpiReturn { callee: host::id() },
+        vault::instruction::CheckCpiReturn {
+            instruction_data: pause.data,
+            expected: Vec::new(),
+        },
+    );
+    forwarded.accounts.extend(pause.accounts);
+
+    context.process_and_validate_instruction(
+        &forwarded,
+        &[custom_error(ZamaHostError::WalletPauseThroughCpi)],
+    );
+    assert_eq!(paused(&context, host_config), host::PauseFlags::default());
+}
+
+/// A PDA pauser, such as a Squads vault, pauses through CPI: only its own program can sign for
+/// it, with `invoke_signed`.
+#[test]
+fn mollusk_a_vault_pda_pauses_through_cpi() {
+    let admin = Pubkey::new_unique();
+    let executor = Pubkey::new_unique();
+    let (vault_pda, _) = vault::vault_address(executor);
+    let (host_config, account) = host_config_account(admin);
+    let context = vault_context(vec![
+        (host_config, account),
+        (executor, funded_system_account()),
+        zama_solana_test_kit::pauser_record_account(vault_pda, true),
+    ]);
+    let pause = anchor_ix(
+        vault::id(),
+        vault::accounts::VaultPause {
+            executor,
+            vault: vault_pda,
+            pauser_record: host::pauser_address(vault_pda).0,
+            host_config,
+            event_authority: event_authority(host::id()),
+            zama_host: host::id(),
+        },
+        vault::instruction::PauseViaVault { areas: EXECUTION },
+    );
+
+    context.process_and_validate_instruction(&pause, &[Check::success()]);
+    assert_eq!(paused(&context, host_config), EXECUTION);
+}
+
+#[test]
+fn mollusk_only_an_enabled_pauser_pauses() {
+    let admin = Pubkey::new_unique();
+    let withdrawn = Pubkey::new_unique();
+    let pauser = Pubkey::new_unique();
+    let (host_config, account) = host_config_account(admin);
+    let context = mollusk_execute_context(
+        admin,
+        vec![
+            (host_config, account),
+            (withdrawn, funded_system_account()),
+            zama_solana_test_kit::pauser_record_account(withdrawn, false),
+            zama_solana_test_kit::pauser_record_account(pauser, true),
+        ],
+    );
+
+    context.process_and_validate_instruction(
+        &pause_ix(withdrawn, host_config, EXECUTION),
+        &[custom_error(ZamaHostError::NotPauser)],
+    );
+    // The admin holds no pauser record, so it cannot pause either (EVM `ACL.pause`).
+    context.process_and_validate_instruction(
+        &pause_ix(admin, host_config, EXECUTION),
+        &[anchor_framework_error_check(
+            anchor_lang::error::ErrorCode::AccountNotInitialized,
+        )],
+    );
+    // Nor by presenting another pauser's enabled record.
+    let mut borrowed = pause_ix(admin, host_config, EXECUTION);
+    borrowed.accounts[1].pubkey = host::pauser_address(pauser).0;
+    context.process_and_validate_instruction(
+        &borrowed,
+        &[anchor_framework_error_check(
+            anchor_lang::error::ErrorCode::ConstraintSeeds,
+        )],
+    );
+    assert_eq!(paused(&context, host_config), host::PauseFlags::default());
+}
+
+#[test]
+fn mollusk_set_grant_deny_list_enabled_persists() {
+    let admin = Pubkey::new_unique();
+    let (host_config, account) = host_config_account(admin);
+    let context = mollusk_execute_context(admin, vec![(host_config, account)]);
+
+    context.process_and_validate_instruction(
+        &host_admin_ix(
+            admin,
+            host_config,
+            host::instruction::SetGrantDenyListEnabled { enabled: true },
+        ),
+        &[Check::success()],
+    );
+    assert!(
+        read_host_config(&context, host_config)
+            .expect("config")
+            .grant_deny_list_enabled
+    );
+}
+
+#[test]
+fn mollusk_set_admin_transfers_to_cosigning_keypair() {
+    // The everyday rotation: a wallet key that co-signs the transfer.
+    let admin = Pubkey::new_unique();
+    let new_admin = Pubkey::new_unique();
+    let (host_config, account) = host_config_account(admin);
+    let context = mollusk_execute_context(admin, vec![(host_config, account)]);
+    let mut ix = set_admin_ix(admin, host_config, new_admin);
+    for meta in ix.accounts.iter_mut() {
+        if meta.pubkey == new_admin {
+            meta.is_signer = true;
+        }
+    }
+
+    context.process_and_validate_instruction(&ix, &[Check::success()]);
+    assert_eq!(
+        read_host_config(&context, host_config)
+            .expect("config")
+            .admin,
+        new_admin
+    );
+}
+
+#[test]
+fn mollusk_set_admin_rejects_keypair_that_does_not_cosign() {
+    // An on-curve key can only become admin by signing; the current admin cannot hand the role
+    // to a wallet that never agreed to take it.
+    let admin = Pubkey::new_unique();
+    let new_admin = Pubkey::new_unique();
+    let (host_config, account) = host_config_account(admin);
+    let context = mollusk_execute_context(admin, vec![(host_config, account)]);
+
+    context.process_and_validate_instruction(
+        &set_admin_ix(admin, host_config, new_admin),
+        &[custom_error(ZamaHostError::HostConfigAdminMismatch)],
+    );
+    assert_eq!(
+        read_host_config(&context, host_config)
+            .expect("config")
+            .admin,
+        admin
+    );
+}
+
+#[test]
+fn mollusk_set_admin_transfers_to_pda_without_cosign() {
+    let admin = Pubkey::new_unique();
+    let (new_admin, _) = Pubkey::find_program_address(&[b"new-admin"], &host::id());
+    let (host_config, account) = host_config_account(admin);
+    let context = mollusk_execute_context(
+        admin,
+        vec![(host_config, account), (new_admin, program_owned_account())],
+    );
+
+    context.process_and_validate_instruction(
+        &set_admin_ix(admin, host_config, new_admin),
+        &[Check::success()],
+    );
+    assert_eq!(
+        read_host_config(&context, host_config)
+            .expect("config")
+            .admin,
+        new_admin
+    );
+}
+
+#[test]
+fn mollusk_set_admin_rejects_unallocated_off_curve_key() {
+    // An off-curve key that is still System-owned (never allocated) must not skip co-sign.
+    let admin = Pubkey::new_unique();
+    let (new_admin, _) = Pubkey::find_program_address(&[b"typo"], &host::id());
+    let (host_config, account) = host_config_account(admin);
+    let context = mollusk_execute_context(admin, vec![(host_config, account)]);
+
+    context.process_and_validate_instruction(
+        &set_admin_ix(admin, host_config, new_admin),
+        &[custom_error(ZamaHostError::HostConfigAdminMismatch)],
+    );
+    assert_eq!(
+        read_host_config(&context, host_config)
+            .expect("config")
+            .admin,
+        admin
+    );
+}
+
+#[test]
+fn mollusk_set_eip712_domain_persists_zeros() {
+    let admin = Pubkey::new_unique();
+    let (host_config, account) = host_config_account(admin);
+    let context = mollusk_execute_context(admin, vec![(host_config, account)]);
+
+    context.process_and_validate_instruction(
+        &host_admin_ix(
+            admin,
+            host_config,
+            host::instruction::SetEip712Domain {
+                gateway_chain_id: 0,
+                input_verification_contract: [0u8; 20],
+                decryption_contract: [0u8; 20],
+            },
+        ),
+        &[Check::success()],
+    );
+    let config = read_host_config(&context, host_config).expect("config");
+    assert_eq!(config.gateway_chain_id, 0);
+    assert_eq!(config.input_verification_contract, [0u8; 20]);
+    assert_eq!(config.decryption_contract, [0u8; 20]);
+}
+
+// ---- close_owned_accounts (admin-sweep) ----
+
+/// The default-cargo-feature artifact lacks `close_owned_accounts`; only the `admin-sweep` feature
+/// set has it. check-zama-host-idl.sh builds that set as `zama_host_admin_sweep.so` for these tests
+/// alone.
+fn sweep_context(payer: Pubkey, seeded_accounts: Vec<(Pubkey, Account)>) -> Ctx {
+    let mut accounts = std::collections::HashMap::from([(payer, funded_system_account())]);
+    accounts.extend(seeded_accounts);
+    zama_solana_test_kit::svm(&host::id(), "zama_host_admin_sweep").with_context(accounts)
+}
+
+fn read_lamports(context: &Ctx, address: Pubkey) -> u64 {
+    context
+        .account_store
+        .borrow()
+        .get(&address)
+        .map_or(0, |account| account.lamports)
+}
+
+/// `close_owned_accounts` signed by `admin` with `targets` as remaining accounts.
+fn close_owned_accounts_ix(admin: Pubkey, targets: &[Pubkey]) -> Instruction {
+    let mut ix = anchor_ix(
+        host::id(),
+        host::accounts::CloseOwnedAccounts {
+            admin,
+            program_data: bpf_loader_upgradeable::get_program_data_address(&host::ID),
+        },
+        host::instruction::CloseOwnedAccounts {},
+    );
+    ix.accounts
+        .extend(targets.iter().map(|target| writable(*target)));
+    ix
+}
+
+#[test]
+fn mollusk_close_owned_accounts_refunds_admin_and_skips_foreign_accounts() {
+    // A target list built from `getProgramAccounts` may name an account the program no longer
+    // owns, or name one twice; neither fails the instruction and neither is refunded twice.
+    let admin = Pubkey::new_unique();
+    let (host_config, host_config_acct) = host_config_account(admin);
+    let owned = Pubkey::new_unique();
+    let owned_acct = program_owned_account();
+    let foreign = Pubkey::new_unique();
+    let foreign_acct = Account {
+        owner: Pubkey::new_unique(),
+        data: vec![7; 16],
+        ..program_owned_account()
+    };
+    let (program_data, program_data_acct) = program_data_account(Some(admin));
+    let context = sweep_context(
+        admin,
+        vec![
+            (host_config, host_config_acct.clone()),
+            (owned, owned_acct.clone()),
+            (foreign, foreign_acct.clone()),
+            (program_data, program_data_acct),
+        ],
+    );
+    let admin_before = read_lamports(&context, admin);
+
+    context.process_and_validate_instruction(
+        &close_owned_accounts_ix(admin, &[host_config, owned, foreign, owned]),
+        &[Check::success()],
+    );
+
+    assert!(account_is_system_owned_and_empty(&context, host_config));
+    assert!(account_is_system_owned_and_empty(&context, owned));
+    assert_eq!(
+        context.account_store.borrow().get(&foreign),
+        Some(&foreign_acct)
+    );
+    assert_eq!(
+        read_lamports(&context, admin),
+        admin_before + host_config_acct.lamports + owned_acct.lamports
+    );
+}
+
+#[test]
+fn mollusk_close_owned_accounts_fits_one_deployer_transaction() {
+    // wipe.ts sends this many targets per version 1 transaction (4,096 bytes, 64 account keys). A
+    // full batch fits the stricter 1232-byte legacy packet and stays under 200k compute units.
+    const TARGETS_PER_TRANSACTION: usize = 25; // mirrors solana/deploy/src/wipe.ts
+    let admin = Pubkey::new_unique();
+    let (program_data, program_data_acct) = program_data_account(Some(admin));
+    let targets: Vec<Pubkey> = (0..TARGETS_PER_TRANSACTION)
+        .map(|_| Pubkey::new_unique())
+        .collect();
+    let mut seeded = vec![(program_data, program_data_acct)];
+    seeded.extend(targets.iter().map(|t| (*t, program_owned_account())));
+    let context = sweep_context(admin, seeded);
+    let admin_before = read_lamports(&context, admin);
+    let ix = close_owned_accounts_ix(admin, &targets);
+
+    let message = solana_sdk::message::Message::new(std::slice::from_ref(&ix), Some(&admin));
+    let transaction_bytes =
+        1 + 64 * usize::from(message.header.num_required_signatures) + message.serialize().len();
+    assert!(
+        transaction_bytes <= solana_packet::PACKET_DATA_SIZE,
+        "a full sweep transaction is {transaction_bytes} bytes"
+    );
+
+    let result = context.process_and_validate_instruction(&ix, &[Check::success()]);
+
+    assert!(
+        result.compute_units_consumed < 200_000,
+        "a full sweep used {} compute units",
+        result.compute_units_consumed
+    );
+    assert!(targets
+        .iter()
+        .all(|t| account_is_system_owned_and_empty(&context, *t)));
+    assert_eq!(
+        read_lamports(&context, admin),
+        admin_before + targets.len() as u64 * program_owned_account().lamports
+    );
+}
+
+#[test]
+fn mollusk_default_artifact_rejects_close_owned_accounts() {
+    // The feature gate is the whole point: the default-feature `zama_host.so` must not dispatch
+    // the sweep discriminator, so this test loads that artifact rather than the sweep build. A
+    // default build that grew the feature would dispatch and succeed, failing the error check.
+    let admin = Pubkey::new_unique();
+    let owned = Pubkey::new_unique();
+    let (program_data, program_data_acct) = program_data_account(Some(admin));
+    let context = zama_solana_test_kit::svm(&host::id(), "zama_host").with_context(
+        std::collections::HashMap::from([
+            (admin, funded_system_account()),
+            (owned, program_owned_account()),
+            (program_data, program_data_acct),
+        ]),
+    );
+
+    context.process_and_validate_instruction(
+        &close_owned_accounts_ix(admin, &[owned]),
+        &[anchor_framework_error_check(
+            anchor_lang::error::ErrorCode::InstructionFallbackNotFound,
+        )],
+    );
+}
+
+#[test]
+fn mollusk_close_owned_accounts_rejects_signer_who_is_not_upgrade_authority() {
+    // `HostConfig.admin` is not enough: only the upgrade authority can wipe, so a rotated
+    // config admin on a program it does not control cannot drain accounts.
+    let admin = Pubkey::new_unique();
+    let (host_config, host_config_acct) = host_config_account(admin);
+    let (program_data, program_data_acct) = program_data_account(Some(Pubkey::new_unique()));
+    let context = sweep_context(
+        admin,
+        vec![
+            (host_config, host_config_acct),
+            (program_data, program_data_acct),
+        ],
+    );
+
+    context.process_and_validate_instruction(
+        &close_owned_accounts_ix(admin, &[host_config]),
+        &[custom_error(ZamaHostError::HostConfigAdminMismatch)],
+    );
+    assert!(read_host_config(&context, host_config).is_some());
+}
+
+#[test]
+fn mollusk_close_owned_accounts_rejects_finalized_program() {
+    // With no upgrade authority nobody can wipe: the accounts of a finalized program are permanent.
+    let admin = Pubkey::new_unique();
+    let (host_config, host_config_acct) = host_config_account(admin);
+    let (program_data, program_data_acct) = program_data_account(None);
+    let context = sweep_context(
+        admin,
+        vec![
+            (host_config, host_config_acct),
+            (program_data, program_data_acct),
+        ],
+    );
+
+    context.process_and_validate_instruction(
+        &close_owned_accounts_ix(admin, &[host_config]),
+        &[custom_error(ZamaHostError::HostConfigAdminMismatch)],
+    );
+    assert!(read_host_config(&context, host_config).is_some());
+}
+
+#[test]
+fn close_owned_accounts_wire_format_matches_deployer() {
+    // The instruction is absent from the vendored IDL (it is feature-gated), so
+    // solana/deploy/src/wipe.ts hand-builds it: discriminator, then admin (writable signer) and
+    // program_data (readonly) ahead of the writable targets. This reads the bytes and roles from
+    // wipe.ts itself, so a change on either side fails here.
+    use anchor_lang::{Discriminator, ToAccountMetas};
+    const WIPE_TS: &str = include_str!("../../deploy/src/wipe.ts");
+    let literal = WIPE_TS
+        .split_once("const CLOSE_OWNED_ACCOUNTS_DISCRIMINATOR = new Uint8Array([")
+        .and_then(|(_, rest)| rest.split_once("]);"))
+        .expect("wipe.ts declares CLOSE_OWNED_ACCOUNTS_DISCRIMINATOR")
+        .0;
+    let deployer_discriminator: Vec<u8> = literal
+        .split(',')
+        .map(|byte| byte.trim().parse().expect("a u8 literal"))
+        .collect();
+    assert_eq!(
+        host::instruction::CloseOwnedAccounts::DISCRIMINATOR,
+        deployer_discriminator.as_slice()
+    );
+
+    let accounts = WIPE_TS
+        .split_once("accounts: [")
+        .and_then(|(_, rest)| rest.split_once("data: CLOSE_OWNED_ACCOUNTS_DISCRIMINATOR"))
+        .expect("wipe.ts builds the instruction's account list")
+        .0;
+    let deployer_roles: Vec<(bool, bool)> = accounts
+        .split("AccountRole.")
+        .skip(1)
+        .map(|rest| {
+            let role = rest
+                .split(|c: char| !c.is_ascii_uppercase() && c != '_')
+                .next();
+            match role {
+                Some("WRITABLE_SIGNER") => (true, true),
+                Some("READONLY") => (false, false),
+                Some("WRITABLE") => (true, false),
+                _ => panic!("unexpected role in wipe.ts: {role:?}"),
+            }
+        })
+        .collect();
+    let admin = Pubkey::new_unique();
+    let program_data = bpf_loader_upgradeable::get_program_data_address(&host::ID);
+    let mut program_roles: Vec<(bool, bool)> = host::accounts::CloseOwnedAccounts {
+        admin,
+        program_data,
+    }
+    .to_account_metas(None)
+    .iter()
+    .map(|meta| (meta.is_writable, meta.is_signer))
+    .collect();
+    // Every target follows as a writable remaining account.
+    program_roles.push((true, false));
+    assert_eq!(deployer_roles, program_roles);
+}

@@ -1,0 +1,160 @@
+//! Stateful per-application, per-slot HCU block cap for [`super::fhe_execute`].
+//!
+//! The walk charges transaction HCU and dependency depth in the shared transient store. [`charge`]
+//! then adds only this call's HCU to its application's block meter, before account effects
+//! are flushed. A rejected cap rolls back the whole transaction, including the transient store.
+//!
+//! Cap sentinels: `u64::MAX` = unrestricted (touch nothing), `0` = ban untrusted
+//! applications (trusted still bypass), otherwise the metering band.
+//!
+//! The application is the explicit execution Store's `(program, scope)`, authenticated by
+//! its authority signer. Calls without persistent outputs have the same metered identity.
+
+use anchor_lang::prelude::*;
+
+use super::super::common::{create_pda_if_needed, is_uninitialized_pda_account, write_account};
+use super::FheExecute;
+use crate::constants::HCU_UNLIMITED;
+use crate::errors::ZamaHostError;
+use crate::state::{
+    hcu_block_meter_address, hcu_trusted_app_address, AppScope, HcuBlockMeter, HcuTrustedAppRecord,
+    HCU_BLOCK_METER_SEED,
+};
+
+/// The single block-cap sequence: resolve trust, read the meter once, assert the cap with checked
+/// arithmetic (overflow fails closed), lazy-create/reset, write once.
+pub(super) fn charge<'info>(
+    ctx: &Context<'info, FheExecute<'info>>,
+    app: AppScope,
+    execution_total: u64,
+    slot: u64,
+) -> Result<()> {
+    let cap = ctx.accounts.host_config.hcu_block_cap_per_app;
+    // Unrestricted (ship default): short-circuit, touching neither optional account. Zero contention.
+    if cap == HCU_UNLIMITED {
+        return Ok(());
+    }
+    // A well-formed trusted witness bypasses the cap entirely — even under a ban.
+    if resolve_trusted(ctx, app)? {
+        return Ok(());
+    }
+    // Ban: every untrusted execution is rejected before the meter is even required.
+    if cap == 0 {
+        return Err(error!(ZamaHostError::HcuBlockLimitExceeded));
+    }
+    // Metering band: an untrusted application must supply its meter (fail closed, never silently
+    // un-metered).
+    let meter = ctx
+        .accounts
+        .hcu_block_meter
+        .as_ref()
+        .ok_or(ZamaHostError::HcuBlockMeterMissing)?;
+    let info = meter.to_account_info();
+    let (expected, bump) = hcu_block_meter_address(app);
+    let used = meter_used_for_slot(&info, app, expected, bump, slot)?;
+    let projected = used
+        .checked_add(execution_total)
+        .ok_or(ZamaHostError::HcuBlockLimitExceeded)?;
+    require!(projected <= cap, ZamaHostError::HcuBlockLimitExceeded);
+
+    // Lazy-create on the first metered execution (noop once program-owned). A pre-squatted, non-empty
+    // account at the meter PDA fails here rather than being adopted.
+    create_pda_if_needed(
+        &ctx.accounts.payer.to_account_info(),
+        &info,
+        &ctx.accounts.system_program.to_account_info(),
+        8 + HcuBlockMeter::SPACE,
+        &[
+            HCU_BLOCK_METER_SEED,
+            app.program.as_ref(),
+            app.scope.as_ref(),
+            &[bump],
+        ],
+    )?;
+    write_account(
+        &info,
+        &HcuBlockMeter {
+            program: app.program,
+            scope: app.scope,
+            last_seen_slot: slot,
+            used_hcu: projected,
+            bump,
+        },
+    )?;
+    Ok(())
+}
+
+/// Resolves the trust witness for `app`:
+/// - `None` / absent (system-owned + empty) ⇒ untrusted (benign — fall through to the meter);
+/// - present, program-owned, canonical PDA, `trusted == true` ⇒ bypass;
+/// - present, program-owned, canonical PDA, `trusted == false` ⇒ untrusted (fall through);
+/// - present but wrong PDA / owner / layout ⇒ `HcuTrustedAppRecordMismatch`.
+fn resolve_trusted<'info>(ctx: &Context<'info, FheExecute<'info>>, app: AppScope) -> Result<bool> {
+    let Some(witness) = ctx.accounts.hcu_trusted_app_record.as_ref() else {
+        return Ok(false);
+    };
+    let info = witness.to_account_info();
+    let (expected, expected_bump) = hcu_trusted_app_address(app);
+    require_keys_eq!(
+        info.key(),
+        expected,
+        ZamaHostError::HcuTrustedAppRecordMismatch
+    );
+    // Present but never created is benign: the application is simply untrusted (metered).
+    if is_uninitialized_pda_account(&info, ZamaHostError::HcuTrustedAppRecordMismatch)? {
+        return Ok(false);
+    }
+    require_keys_eq!(
+        *info.owner,
+        crate::ID,
+        ZamaHostError::HcuTrustedAppRecordMismatch
+    );
+    require!(
+        info.data_len() == 8 + HcuTrustedAppRecord::SPACE,
+        ZamaHostError::HcuTrustedAppRecordMismatch
+    );
+    let data = info.try_borrow_data()?;
+    let mut data_slice: &[u8] = &data;
+    let record = HcuTrustedAppRecord::try_deserialize(&mut data_slice)?;
+    require!(
+        record.bump == expected_bump && record.program == app.program && record.scope == app.scope,
+        ZamaHostError::HcuTrustedAppRecordMismatch
+    );
+    Ok(record.trusted)
+}
+
+/// Effective in-slot usage from a possibly-uninitialized meter. The supplied account must always be
+/// the canonical meter PDA — checked first, so a misaddressed meter is rejected cheaply before
+/// `charge` tries to create it. A non-program-owned account (uninitialized / system-owned /
+/// squatted) is then treated as `0` — `charge`'s lazy-create
+/// rejects a squatter. A program-owned meter is validated
+/// (owner / length / recorded application / bump) before any field is read, then lazy-reset: a
+/// `last_seen_slot` other than the current slot means `0` for this execution.
+fn meter_used_for_slot(
+    info: &AccountInfo,
+    app: AppScope,
+    expected: Pubkey,
+    bump: u8,
+    slot: u64,
+) -> Result<u64> {
+    require_keys_eq!(info.key(), expected, ZamaHostError::HcuBlockMeterMismatch);
+    if info.owner != &crate::ID {
+        return Ok(0);
+    }
+    require!(
+        info.data_len() == 8 + HcuBlockMeter::SPACE,
+        ZamaHostError::HcuBlockMeterMismatch
+    );
+    let data = info.try_borrow_data()?;
+    let mut data_slice: &[u8] = &data;
+    let record = HcuBlockMeter::try_deserialize(&mut data_slice)?;
+    require!(
+        record.program == app.program && record.scope == app.scope && record.bump == bump,
+        ZamaHostError::HcuBlockMeterMismatch
+    );
+    Ok(if record.last_seen_slot != slot {
+        0
+    } else {
+        record.used_hcu
+    })
+}

@@ -1,0 +1,176 @@
+//! Stateless public-decrypt verifier (fhevm-internal#1704).
+//!
+//! `verify_public_decrypt` is a pull-oracle: a caller (usually via CPI) brings a KMS
+//! `PublicDecryptVerification` certificate in its own transaction, this instruction verifies it,
+//! and returns the certified `(handle, cleartext, context_id)` through `return_data`. It creates
+//! nothing, mutates nothing, emits nothing, and needs no signer. Like EVM `FHE.checkSignatures`, it
+//! reads no ACL state: every KMS connector proved the handle's public leaf before decrypting, so the
+//! certificate is the authorization. A consumer binds the certificate to its own state by passing a
+//! handle it pinned in an account it owns (INVARIANTS #21). Act-once and timeout live in the
+//! consuming app's own state machine, exactly as an EVM app tracks its decryption callbacks.
+//!
+//! The cert is verified against the `KmsContext` the certificate itself names in its signed
+//! `extra_data` (EVM `_extractContextId` parity), as long as that context is still alive
+//! (`destroyed == false`). A cert minted just before a rotation stays verifiable under its own
+//! context — matching EVM, where a request pinned to context N is answerable by N's signers until an
+//! operator calls `destroyKmsContext(N)`. Rotation for hygiene keeps in-flight work alive;
+//! `destroy_kms_context(N)` is the revocation lever that instantly invalidates every outstanding
+//! N-cert. The verified context id is surfaced via `return_data` so a calling program can layer its
+//! own policy (accept any live context, or demand current-only) on top. A consumer that ignores the
+//! returned context id is thereby choosing the permissive policy — it accepts a certificate from
+//! *any* live context; demanding current-only means comparing the returned id against
+//! `host_config.current_kms_context_id` in the consuming program.
+//!
+//! ## Act-once: what a consumer owes
+//!
+//! This instruction can be replayed as often as a caller pays for it, so every consumer has to
+//! decide whether its own effect may happen twice. The rule:
+//!
+//! - Releasing information — emitting the certified cleartext, caching it, displaying it — is
+//!   idempotent. A sealed handle is public forever, so a second run reveals nothing new and needs no
+//!   act-once state (`confidential-token::disclose_secp`).
+//! - Moving value or advancing a state machine on the certified cleartext is not. Guard it with an
+//!   account that is *opened* when the value-moving effect is first produced and *closed* exactly
+//!   once when it is finally consumed, so a second consumption attempt fails because the account is
+//!   gone (`confidential-token::redeem_burned_amount`, which closes the `PendingBurn` that
+//!   `confidential_burn` opened at seeds `["pending-burn", mint, token_account]`; the alternate close
+//!   path is `cancel_pending_burn`, while the burned handle is still current). Unlike a forever
+//!   write-once marker, the account's rent returns to the owner on close instead of being locked up
+//!   permanently.
+//!
+//! The guard account cannot ship from a shared crate: Anchor derives an account type's owner from the
+//! program that declares it, so state declared here would be owned by this program and unusable as
+//! an app's own state. What is shared is this rule, the reference implementation named above, and
+//! the tests that pin both sides of it — see INVARIANTS #24.
+
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::program::set_return_data;
+
+use super::common::assert_no_remaining_accounts;
+use crate::{eip712, errors::ZamaHostError, state::*};
+
+/// Typed layout of the `return_data` written by `verify_public_decrypt`, shared with CPI
+/// consumers so nobody hand-computes byte offsets. Borsh of this struct is
+/// `handle ‖ cleartext ‖ context_id` (96 bytes).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PublicDecryptReturnData {
+    /// The handle the KMS certificate covers.
+    pub handle: [u8; 32],
+    /// The certified 32-byte big-endian `uint256` cleartext.
+    pub cleartext: [u8; 32],
+    /// The verified KMS context id, letting a caller set its own rotation policy — an
+    /// informational consumer accepts any live context, a value-releasing one may demand
+    /// `context_id == host_config.current_kms_context_id`.
+    pub context_id: [u8; 32],
+}
+
+/// Accounts for `verify_public_decrypt`. All read-only: a pure verifier reads state and returns a
+/// value, so it takes no payer, no signer, and no system program.
+#[derive(Accounts)]
+pub struct VerifyPublicDecrypt<'info> {
+    /// Canonical singleton host config: source of the current KMS context id and the gateway
+    /// EIP-712 domain (chain id + `Decryption` verifying contract).
+    #[account(seeds = [HOST_CONFIG_SEED], bump = host_config.bump)]
+    pub host_config: Account<'info, HostConfig>,
+    /// KMS context PDA; must be the canonical PDA for the id the certificate commits to in its
+    /// signed `extra_data`, and must not be destroyed. Verified in the handler.
+    #[account(seeds = [KMS_CONTEXT_SEED, &kms_context.context_id], bump = kms_context.bump)]
+    pub kms_context: Account<'info, KmsContext>,
+}
+
+/// Verifies a KMS public-decrypt certificate against the context the cert names (any live context)
+/// and returns `(handle ++ cleartext ++ context_id)` via `return_data`.
+///
+/// `cleartext` is the 32-byte big-endian `uint256` the KMS signs over (today's decrypted result
+/// fits in 32 bytes); `context_id` is the verified 32-byte id; `return_data` is 96
+/// bytes, well under the 1024-byte limit.
+pub fn verify_public_decrypt(
+    ctx: Context<VerifyPublicDecrypt>,
+    handle: [u8; 32],
+    cleartext: [u8; 32],
+    signatures: Vec<[u8; 65]>,
+    extra_data: Vec<u8>,
+) -> Result<()> {
+    assert_no_remaining_accounts(ctx.remaining_accounts)?;
+    let host_config = &ctx.accounts.host_config;
+    let kms_context = &ctx.accounts.kms_context;
+    let current_context_id = host_config.current_kms_context_id;
+
+    require!(
+        host_config.decryption_contract != [0u8; 20] && current_context_id != [0u8; 32],
+        ZamaHostError::GatewayVerifierConfigUnset
+    );
+
+    // Resolve the context id the certificate commits to via its signed `extra_data` (EVM
+    // `KMSVerifier` parity): empty / v0 selects the current context, v1 / v2 carry an explicit
+    // id. Because the KMS signs over `extra_data`, this id is authenticated by the certificate.
+    let cert_context_id = eip712::extract_kms_context_id(&extra_data, current_context_id)
+        .ok_or(ZamaHostError::InvalidKmsContext)?;
+    // Bind the supplied account to that id: it must be the CANONICAL PDA for the cert-committed id,
+    // with a matching stored id. This is the adversarial hinge — an attacker can neither swap in a
+    // different live context's account nor a fake account at a non-canonical address, because the
+    // binding chain is signed extra_data -> context id -> canonical PDA -> signer set.
+    require!(
+        kms_context.context_id == cert_context_id,
+        ZamaHostError::InvalidKmsContext
+    );
+    // The named context must still be alive. Rotation alone keeps an old context's certs verifiable
+    // (EVM-parity liveness); `destroy_kms_context(N)` is the revocation lever that invalidates every
+    // outstanding N-cert in one flag flip.
+    require!(!kms_context.destroyed, ZamaHostError::InvalidKmsContext);
+
+    let verifier = eip712::Eip712VerifierConfig {
+        gateway_chain_id: host_config.gateway_chain_id,
+        verifying_contract: host_config.decryption_contract,
+        signers: &kms_context.signers,
+        threshold: kms_context.thresholds.public_decryption,
+    };
+    require!(
+        eip712::verify_kms_public_decrypt(
+            &verifier,
+            &[handle],
+            &cleartext,
+            &extra_data,
+            &signatures,
+        ),
+        ZamaHostError::InvalidKmsCertificate
+    );
+
+    let return_data = PublicDecryptReturnData {
+        handle,
+        cleartext,
+        context_id: cert_context_id,
+    };
+    // Fixed buffer, not a Vec: this verifier sits on the CPI hot path of disclose_secp,
+    // redeem_burned_amount, and (transitively) batcher settle, and heap allocation costs CU.
+    let mut return_bytes = [0u8; 96];
+    return_data.serialize(&mut return_bytes.as_mut_slice())?;
+    set_return_data(&return_bytes);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Doc-sync guard: this module's docs and DESIGN_DECISIONS.md quote the return_data as
+    /// exactly 96 bytes laid out `handle ‖ cleartext ‖ context_id`. Borsh of
+    /// [`PublicDecryptReturnData`] must stay byte-identical to that layout.
+    #[test]
+    fn return_data_matches_quoted_layout() {
+        let mut context_id = [0u8; 32];
+        context_id[24..].copy_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+        let value = PublicDecryptReturnData {
+            handle: [0xAB; 32],
+            cleartext: [0xCD; 32],
+            context_id,
+        };
+        let mut bytes = Vec::new();
+        value.serialize(&mut bytes).unwrap();
+        let mut expected = vec![0u8; 96];
+        expected[..32].copy_from_slice(&[0xAB; 32]);
+        expected[32..64].copy_from_slice(&[0xCD; 32]);
+        expected[64..].copy_from_slice(&context_id);
+        assert_eq!(bytes, expected);
+    }
+}

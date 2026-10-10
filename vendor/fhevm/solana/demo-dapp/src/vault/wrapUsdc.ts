@@ -1,0 +1,69 @@
+import { tokenStoreAddress } from './internal/encryptedStores.js';
+import { tokenApp, withDenyRecords, type HostPolicyParameters } from './internal/hostPolicy.js';
+import { findAssociatedTokenPda } from '@solana-program/token';
+import { INSTRUCTIONS_SYSVAR_ADDRESS, type TransientStore } from '@fhevm/sdk/solana';
+import type { Address, Instruction, TransactionSigner } from '@solana/kit';
+import {
+  getWrapUsdcInstructionAsync,
+  findTokenAccountPda,
+  findVaultAuthorityPda as findMintVaultAuthorityPda,
+  findTotalSupplyAuthorityPda,
+  CONFIDENTIAL_TOKEN_PROGRAM_ADDRESS,
+} from '@fhevm/confidential-token';
+
+export type SolanaVaultWrapUsdcParameters = HostPolicyParameters & {
+  readonly transientStore: TransientStore;
+  /** Token owner and transfer authority. */
+  readonly owner: TransactionSigner;
+  /** The confidential mint whose balance is increased (e.g. cUSDC). */
+  readonly mint: Address;
+  /** The underlying SPL mint being escrowed (e.g. mock USDC). */
+  readonly underlyingMint: Address;
+  /** Token program that owns `underlyingMint` (`Tokenkeg` or Token-2022). */
+  readonly tokenProgram: Address;
+  /** Public underlying amount to escrow and rotate into the confidential balance. */
+  readonly amount: number | bigint;
+};
+
+/**
+ * Builds `confidential_token::wrap_usdc`: escrows a PUBLIC `amount` of `underlyingMint` from the
+ * owner's associated token account and rotates the owner's confidential balance by that amount. The
+ * amount is public at the wrap boundary, so — unlike a confidential transfer — this needs NO input
+ * proof. The owner's confidential token account, the program's underlying vault and both persistent
+ * encrypted stores are derived here from the mints and owner; the seeder/scenario supplies only
+ * semantic roots and assembles/sends the returned instruction.
+ */
+export async function buildWrapUsdcInstruction(parameters: SolanaVaultWrapUsdcParameters): Promise<Instruction> {
+  const { owner, mint, underlyingMint } = parameters;
+  const [tokenAccount] = await findTokenAccountPda({ mint, owner: owner.address });
+  const [mintVaultAuthority] = await findMintVaultAuthorityPda({ mint });
+  const [totalSupplyAuthority] = await findTotalSupplyAuthorityPda({ mint });
+  const app = tokenApp(mint);
+  const hcu = await parameters.host.hcuAccounts(app);
+  const instruction = await getWrapUsdcInstructionAsync({
+    transientStore: parameters.transientStore.address,
+    instructions: INSTRUCTIONS_SYSVAR_ADDRESS,
+    owner,
+    mint,
+    tokenAccount,
+    underlyingMint,
+    userUsdc: (await findAssociatedTokenPda({
+      owner: owner.address,
+      tokenProgram: parameters.tokenProgram,
+      mint: underlyingMint,
+    }))[0],
+    vaultUsdc: (await findAssociatedTokenPda({
+      owner: mintVaultAuthority,
+      tokenProgram: parameters.tokenProgram,
+      mint: underlyingMint,
+    }))[0],
+    balanceStore: await tokenStoreAddress(mint, tokenAccount),
+    totalSupplyStore: await tokenStoreAddress(mint, totalSupplyAuthority),
+    tokenProgram: parameters.tokenProgram,
+    program: CONFIDENTIAL_TOKEN_PROGRAM_ADDRESS,
+    amount: parameters.amount,
+    hcuBlockMeter: hcu.hcuBlockMeter,
+    hcuTrustedAppRecord: hcu.hcuTrustedAppRecord,
+  });
+  return withDenyRecords(instruction, parameters.host.denyListEnabled, [app]);
+}

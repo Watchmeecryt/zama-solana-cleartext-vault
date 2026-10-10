@@ -1,0 +1,837 @@
+{
+  "address": "HFx5mNcWLvhj2WU8CA9QEhuW6BZVNwA3g7UvPwVzfHx4",
+  "metadata": {
+    "name": "dep_chain",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Specimen zama-host consumer: a long dependent FHE step chain for load smoke"
+  },
+  "instructions": [
+    {
+      "name": "extend",
+      "docs": [
+        "Adds `amount` to the tail `links` times as one execution of `links` DEPENDENT steps:",
+        "every add reads the previous add's transient result, and only the last one persists.",
+        "The tail therefore grows by `links * amount`, but unlike `links` separate executions",
+        "the coprocessor has to schedule every step after the one before it."
+      ],
+      "discriminator": [
+        228,
+        127,
+        0,
+        1,
+        227,
+        154,
+        54,
+        168
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "chain",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  100,
+                  101,
+                  112,
+                  45,
+                  99,
+                  104,
+                  97,
+                  105,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "chain_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  104,
+                  97,
+                  105,
+                  110,
+                  45,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "chain"
+              }
+            ]
+          }
+        },
+        {
+          "name": "encrypted_store",
+          "docs": [
+            "Stable tail encrypted store; read for the current handle and replaced by this",
+            "execution."
+          ],
+          "writable": true
+        },
+        {
+          "name": "host_config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  104,
+                  111,
+                  115,
+                  116,
+                  45,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                184,
+                37,
+                100,
+                59,
+                121,
+                191,
+                68,
+                153,
+                255,
+                49,
+                204,
+                254,
+                138,
+                41,
+                122,
+                160,
+                235,
+                48,
+                168,
+                160,
+                204,
+                31,
+                35,
+                25,
+                232,
+                33,
+                118,
+                193,
+                180,
+                214,
+                94,
+                113
+              ]
+            }
+          }
+        },
+        {
+          "name": "zama_event_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  95,
+                  95,
+                  101,
+                  118,
+                  101,
+                  110,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                184,
+                37,
+                100,
+                59,
+                121,
+                191,
+                68,
+                153,
+                255,
+                49,
+                204,
+                254,
+                138,
+                41,
+                122,
+                160,
+                235,
+                48,
+                168,
+                160,
+                204,
+                31,
+                35,
+                25,
+                232,
+                33,
+                118,
+                193,
+                180,
+                214,
+                94,
+                113
+              ]
+            }
+          }
+        },
+        {
+          "name": "transient_store",
+          "writable": true
+        },
+        {
+          "name": "instructions"
+        },
+        {
+          "name": "zama_program",
+          "address": "DPq5y89RDZPq9NcMh9X1NgjBWgYmSXg3QoipSBV3ZMzQ"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "links",
+          "type": "u8"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "initialize",
+      "docs": [
+        "Creates the chain and its encrypted tail value at zero."
+      ],
+      "discriminator": [
+        175,
+        175,
+        109,
+        31,
+        13,
+        152,
+        155,
+        237
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "chain",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  100,
+                  101,
+                  112,
+                  45,
+                  99,
+                  104,
+                  97,
+                  105,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "chain_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  104,
+                  97,
+                  105,
+                  110,
+                  45,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "chain"
+              }
+            ]
+          }
+        },
+        {
+          "name": "encrypted_store",
+          "writable": true
+        },
+        {
+          "name": "host_config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  104,
+                  111,
+                  115,
+                  116,
+                  45,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                184,
+                37,
+                100,
+                59,
+                121,
+                191,
+                68,
+                153,
+                255,
+                49,
+                204,
+                254,
+                138,
+                41,
+                122,
+                160,
+                235,
+                48,
+                168,
+                160,
+                204,
+                31,
+                35,
+                25,
+                232,
+                33,
+                118,
+                193,
+                180,
+                214,
+                94,
+                113
+              ]
+            }
+          }
+        },
+        {
+          "name": "zama_event_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  95,
+                  95,
+                  101,
+                  118,
+                  101,
+                  110,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                184,
+                37,
+                100,
+                59,
+                121,
+                191,
+                68,
+                153,
+                255,
+                49,
+                204,
+                254,
+                138,
+                41,
+                122,
+                160,
+                235,
+                48,
+                168,
+                160,
+                204,
+                31,
+                35,
+                25,
+                232,
+                33,
+                118,
+                193,
+                180,
+                214,
+                94,
+                113
+              ]
+            }
+          }
+        },
+        {
+          "name": "transient_store",
+          "writable": true
+        },
+        {
+          "name": "instructions"
+        },
+        {
+          "name": "zama_program",
+          "address": "DPq5y89RDZPq9NcMh9X1NgjBWgYmSXg3QoipSBV3ZMzQ"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    }
+  ],
+  "accounts": [
+    {
+      "name": "Chain",
+      "discriminator": [
+        249,
+        97,
+        81,
+        239,
+        108,
+        208,
+        45,
+        27
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "TailValueInvalid",
+      "msg": "tail encrypted store mismatch"
+    },
+    {
+      "code": 6001,
+      "name": "InvalidChainLength",
+      "msg": "chain length must be between 1 and 32 steps"
+    }
+  ],
+  "types": [
+    {
+      "name": "Chain",
+      "docs": [
+        "One owner's chain. The owner is bound by the PDA seeds; the stored bumps let instructions",
+        "skip the bump search."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "authority_bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "EncryptedSlot",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "key",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "handle",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "EncryptedStore",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "program",
+            "type": "pubkey"
+          },
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "scope",
+            "type": "pubkey"
+          },
+          {
+            "name": "slots",
+            "type": {
+              "vec": {
+                "defined": {
+                  "name": "EncryptedSlot"
+                }
+              }
+            }
+          },
+          {
+            "name": "leaf_count",
+            "type": "u64"
+          },
+          {
+            "name": "peaks",
+            "type": {
+              "vec": {
+                "array": [
+                  "u8",
+                  32
+                ]
+              }
+            }
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "HostConfig",
+      "docs": [
+        "Singleton host configuration and authority surface.",
+        "",
+        "`HostConfig` is the runtime switchboard for this PoC. Each paused area rejects the",
+        "instructions it covers (`PauseFlags`)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "admin",
+            "docs": [
+              "Program administrator allowed to update config flags."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "chain_id",
+            "docs": [
+              "Host-chain id included in handle derivation."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "gateway_chain_id",
+            "docs": [
+              "EVM gateway chain id used in the coprocessor/KMS EIP-712 domain separators."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "input_verification_contract",
+            "docs": [
+              "EVM `InputVerification` contract address: the EIP-712 verifying contract for",
+              "coprocessor `CiphertextVerification` input attestations."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                20
+              ]
+            }
+          },
+          {
+            "name": "coprocessor_signers",
+            "docs": [
+              "Registered coprocessor EVM signer set for input attestations (EVM `InputVerifier`",
+              "parity). Fixed-capacity so `HostConfig` keeps a pinned byte layout; only the first",
+              "`coprocessor_signer_count` entries are active, the rest are zero padding."
+            ],
+            "type": {
+              "array": [
+                {
+                  "array": [
+                    "u8",
+                    20
+                  ]
+                },
+                8
+              ]
+            }
+          },
+          {
+            "name": "coprocessor_signer_count",
+            "docs": [
+              "Number of active entries in `coprocessor_signers`."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "coprocessor_threshold",
+            "docs": [
+              "Minimum distinct valid signatures (n-of-m) required over an input attestation;",
+              "`1 <= coprocessor_threshold <= coprocessor_signer_count`."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "decryption_contract",
+            "docs": [
+              "EVM `Decryption` contract address: the EIP-712 verifying contract for KMS",
+              "`PublicDecryptVerification` certificates (disclose/redeem)."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                20
+              ]
+            }
+          },
+          {
+            "name": "current_kms_context_id",
+            "docs": [
+              "Active KMS context id (mirrors `ProtocolConfig.getCurrentKmsContextId`). The",
+              "signer set + thresholds live in the `KmsContext` PDA at this id; `[0; 32]` means",
+              "none defined yet. Updated by `define_kms_context`."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "current_kms_epoch_id",
+            "docs": [
+              "Active KMS epoch id of the active context (with the context, mirrors",
+              "`ProtocolConfig.getCurrentKmsContextAndEpoch`); `[0; 32]` until the first context. Updated",
+              "by `define_kms_context` and `define_kms_epoch`. Certificate verification reads only the context."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "paused",
+            "docs": [
+              "Host areas currently stopped. A pauser sets them; only the admin clears them (DD-058)."
+            ],
+            "type": {
+              "defined": {
+                "name": "PauseFlags"
+              }
+            }
+          },
+          {
+            "name": "grant_deny_list_enabled",
+            "docs": [
+              "Enables the deny list: a denied application `(program, scope)` cannot compute, allow, or make a handle public."
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "max_hcu_per_tx",
+            "docs": [
+              "Max total HCU summed over every execution in one transaction. `u64::MAX` = unlimited",
+              "(enforcement off); `0` is rejected at set time."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "max_hcu_depth_per_tx",
+            "docs": [
+              "Max critical-path (depth) HCU across every execution in one transaction. `u64::MAX` =",
+              "unlimited; `0` is rejected at set time."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "hcu_block_cap_per_app",
+            "docs": [
+              "Per-app HCU budget per slot, enforced in `fhe_execute`. `u64::MAX` = unrestricted (the ship",
+              "default; short-circuits, touching no meter); `0` = ban untrusted apps (trusted still",
+              "bypass) — the one knob where `0` is a real semantic; any other value is the metering band",
+              "(must be `>= max_hcu_per_tx` unless that is unlimited)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "docs": [
+              "PDA bump for `PDA(\"host-config\")`."
+            ],
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PauseFlags",
+      "docs": [
+        "The host areas a pauser can stop, each matching an area EVM pauses on its own (DD-058). As",
+        "the argument of `pause` and `unpause`, a set field names an area to change."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "execution",
+            "docs": [
+              "`fhe_execute`, with the allows, transient grants and public releases it writes (EVM ACL",
+              "pause, which stops execution through `allowTransient`)."
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "verified_inputs",
+            "docs": [
+              "`fhe_execute` steps that consume a coprocessor-attested input (no EVM counterpart:",
+              "`InputVerifier` cannot be paused, DD-058)."
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "acl_writes",
+            "docs": [
+              "ACL writes outside an execution: Store creation, `make_store_handle_public` and",
+              "user-decryption delegation (EVM ACL pause)."
+            ],
+            "type": "bool"
+          }
+        ]
+      }
+    }
+  ],
+  "constants": [
+    {
+      "name": "ENCRYPTED_TAIL_LABEL",
+      "docs": [
+        "Fixed encrypted value label for the chain tail."
+      ],
+      "type": {
+        "array": [
+          "u8",
+          32
+        ]
+      },
+      "value": "[116, 97, 105, 108, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95]"
+    },
+    {
+      "name": "MAX_CHAIN_LINKS",
+      "docs": [
+        "The deepest chain one `extend` can carry: the host's `MAX_FHE_EXECUTION_STEPS`, the one step",
+        "ceiling for executions built on-chain and off (see the module docs — extending at this depth",
+        "is what verifies the maximum execution fits the fixed program heap)."
+      ],
+      "type": "u8",
+      "value": "32"
+    }
+  ]
+}

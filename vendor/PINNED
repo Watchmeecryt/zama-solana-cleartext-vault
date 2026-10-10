@@ -1,0 +1,5 @@
+source: https://github.com/zama-ai/fhevm
+branch: feature/solana
+commit: 9e244da02172ce79d6c2e24cf1eed3d45e0bb808
+date: 2026-10-10
+message: feat(solana): settle refunds a deposit batch worth zero vault shares (#4386)

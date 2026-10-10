@@ -1,0 +1,115 @@
+//! Defines a new KMS context (Solana mirror of `ProtocolConfig.mirrorKmsContextAndEpoch`).
+//!
+//! Creates the `KmsContext` PDA for `context_id`, records the KMS node signer set +
+//! thresholds, and makes `context_id` and `epoch_id` the active pair in `HostConfig`. As on EVM,
+//! each new context id and epoch id must be above the current one, so neither moves back and no
+//! context is defined twice. A used context id already fails in the `init` of its PDA, before this
+//! check. Admin-gated in the PoC.
+
+use anchor_lang::prelude::*;
+
+use super::common::{
+    assert_admin, assert_evm_signer_set, assert_no_remaining_accounts, assert_quorum_threshold,
+    EvmSignerSetErrors,
+};
+use crate::event_cpi::emit_event_cpi;
+use crate::events::NewKmsContextEvent;
+use crate::{errors::ZamaHostError, state::*};
+
+/// Accounts for defining a new KMS context.
+#[derive(Accounts)]
+#[event_cpi]
+#[instruction(context_id: [u8; 32])]
+pub struct DefineKmsContext<'info> {
+    /// Configured host admin and rent payer for the context account.
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    /// Singleton config PDA; its active context and epoch are set to `context_id` and `epoch_id`.
+    #[account(mut, seeds = [HOST_CONFIG_SEED], bump = host_config.bump)]
+    pub host_config: Account<'info, HostConfig>,
+    /// KMS context PDA created for `context_id`.
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + KmsContext::SPACE,
+        seeds = [KMS_CONTEXT_SEED, &context_id],
+        bump
+    )]
+    pub kms_context: Account<'info, KmsContext>,
+    /// System program used for account creation.
+    pub system_program: Program<'info, System>,
+}
+
+/// Records a new KMS context and makes it and `epoch_id` the active pair.
+pub fn define_kms_context(
+    ctx: Context<DefineKmsContext>,
+    context_id: [u8; 32],
+    epoch_id: [u8; 32],
+    signers: Vec<[u8; 20]>,
+    thresholds: KmsThresholds,
+) -> Result<()> {
+    assert_no_remaining_accounts(ctx.remaining_accounts)?;
+    assert_admin(&ctx.accounts.host_config, &ctx.accounts.admin)?;
+    // `[u8; 32]` compares lexicographically, which is EVM's big-endian `uint256` order.
+    require!(
+        context_id > ctx.accounts.host_config.current_kms_context_id,
+        ZamaHostError::NonIncreasingKmsContextId
+    );
+    require!(
+        epoch_id > ctx.accounts.host_config.current_kms_epoch_id,
+        ZamaHostError::NonIncreasingKmsEpochId
+    );
+    assert_evm_signer_set(
+        &signers,
+        KmsContext::MAX_SIGNERS,
+        EvmSignerSetErrors {
+            empty: ZamaHostError::EmptyKmsContext,
+            too_many: ZamaHostError::TooManyKmsSigners,
+            duplicate: ZamaHostError::DuplicateKmsSigner,
+            zero: ZamaHostError::ZeroKmsSigner,
+        },
+    )?;
+    let signer_count = signers.len();
+    assert_quorum_threshold(
+        thresholds.public_decryption,
+        signer_count,
+        ZamaHostError::InvalidKmsThreshold,
+    )?;
+    assert_quorum_threshold(
+        thresholds.user_decryption,
+        signer_count,
+        ZamaHostError::InvalidKmsThreshold,
+    )?;
+    assert_quorum_threshold(
+        thresholds.kms_gen,
+        signer_count,
+        ZamaHostError::InvalidKmsThreshold,
+    )?;
+    // `mpc` is stored for fidelity and may be zero; only an upper bound applies.
+    require!(
+        (thresholds.mpc as usize) <= signer_count,
+        ZamaHostError::InvalidKmsThreshold
+    );
+
+    let kms_context = &mut ctx.accounts.kms_context;
+    kms_context.context_id = context_id;
+    kms_context.signers = signers.clone();
+    kms_context.thresholds = thresholds;
+    kms_context.destroyed = false;
+    kms_context.bump = ctx.bumps.kms_context;
+    ctx.accounts.host_config.current_kms_context_id = context_id;
+    ctx.accounts.host_config.current_kms_epoch_id = epoch_id;
+
+    emit_event_cpi(
+        &ctx.accounts.event_authority,
+        &NewKmsContextEvent {
+            version: EVENT_VERSION,
+            kms_context_id: context_id,
+            kms_epoch_id: epoch_id,
+            signers,
+            public_decryption_threshold: thresholds.public_decryption,
+            user_decryption_threshold: thresholds.user_decryption,
+        },
+    )?;
+    Ok(())
+}

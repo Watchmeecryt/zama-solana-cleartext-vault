@@ -1,0 +1,1633 @@
+//! Mollusk runtime tests for the user-decryption delegation instructions — grant, re-grant,
+//! revoke.
+//!
+//! The record these instructions maintain is what the KMS Connector's delegated branch reads,
+//! so nearly everything worth testing is a negative: a record another party could create,
+//! refresh or keep alive against the delegator's will would let a delegate decrypt what the
+//! delegator never allowed. The delegator's signature and the canonical PDA are the whole
+//! authorization story on this side.
+//!
+//! Two behaviours are pinned deliberately rather than discovered:
+//!
+//! * a grant whose application is the wildcard `[0xff; 32]` in both its program and its scope
+//!   position is legal and writes an ordinary record — that row is the delegator's grant across
+//!   every application, the same rule the EVM ACL applies to its wildcard delegation address;
+//! * both grant and revoke are gated by the `acl_writes` pause flag. During an incident pause
+//!   the delegator's only lever over existing delegations is blocked while those delegations
+//!   keep authorizing (the Connector's reads are pause-blind) — an asymmetry shared with the EVM
+//!   side and raised there as an open question; these tests pin the current parity, not endorse
+//!   it.
+//!
+//! Build the program artifact before running these (`bash scripts/check-zama-host-idl.sh`); a
+//! stale `.so` makes the whole harness fail on an unrelated missing sysvar rather than on
+//! anything these tests assert.
+
+use anchor_lang::{
+    prelude::system_program, AccountDeserialize, Discriminator, InstructionData, ToAccountMetas,
+};
+use delegator_vault as vault;
+use mollusk_svm::{result::Check, Mollusk};
+use solana_sdk::{
+    account::Account,
+    instruction::{AccountMeta, Instruction},
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+};
+use zama_host::{self as host, AppScope, UserDecryptionDelegation};
+use zama_solana_test_kit::{
+    anchor_framework_error_check, cost_snapshot, empty_system_account,
+    funded_system_account as funded_wallet, host_config_account as host_config_account_from,
+    paused_host_config, program_owned_account, serialized_account as serialized,
+    system_program_account, HostConfigParams,
+};
+
+mod host_fixtures;
+use host_fixtures::host_program_account;
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+/// The slot every test runs at. Existing records are written at [`EARLIER_SLOT`], so the
+/// once-per-slot guard does not interfere with tests that are not about it.
+const CURRENT_SLOT: u64 = 100;
+const EARLIER_SLOT: u64 = 50;
+/// The Unix second every test runs at.
+const NOW: u64 = 1_700_000_000;
+/// The expiry every grant asks for, an hour after [`NOW`].
+const EXPIRES_AT: u64 = NOW + 3_600;
+
+fn mollusk() -> Mollusk {
+    let mut mollusk = zama_solana_test_kit::svm(&host::id(), "zama_host");
+    mollusk.sysvars.clock.slot = CURRENT_SLOT;
+    mollusk.sysvars.clock.unix_timestamp = NOW as i64;
+    mollusk
+}
+
+fn anchor_ix<A, D>(accounts: A, args: D) -> Instruction
+where
+    A: ToAccountMetas,
+    D: InstructionData,
+{
+    zama_solana_test_kit::anchor_ix(host::id(), accounts, args)
+}
+
+fn custom_error(error: host::errors::ZamaHostError) -> Check<'static> {
+    zama_solana_test_kit::anchor_error_check(error as u32)
+}
+
+/// A host config whose ACL-writes area, the one delegation belongs to, is paused or not.
+fn host_config_account(acl_writes_paused: bool) -> (Pubkey, Account) {
+    host_config_account_from(&HostConfigParams {
+        paused: host::PauseFlags {
+            acl_writes: acl_writes_paused,
+            ..host::PauseFlags::default()
+        },
+        ..HostConfigParams::new(Pubkey::new_unique())
+    })
+}
+
+fn grant_ix(
+    payer: Pubkey,
+    delegator: Pubkey,
+    delegation_record: Pubkey,
+    delegate: Pubkey,
+    app: AppScope,
+    expires_at: u64,
+) -> Instruction {
+    let (host_config, _) = host::host_config_address();
+    anchor_ix(
+        host::accounts::DelegateForUserDecryption {
+            payer,
+            delegator,
+            host_config,
+            scope: app.scope,
+            delegation_record,
+            system_program: system_program::ID,
+        },
+        host::instruction::DelegateForUserDecryption {
+            delegate,
+            program: app.program,
+            expires_at,
+        },
+    )
+}
+
+fn revoke_ix(delegator: Pubkey, delegation_record: Pubkey) -> Instruction {
+    let (host_config, _) = host::host_config_address();
+    anchor_ix(
+        host::accounts::RevokeDelegationForUserDecryption {
+            delegator,
+            host_config,
+            delegation_record,
+        },
+        host::instruction::RevokeDelegationForUserDecryption {},
+    )
+}
+
+/// The tuple every test grants over, with a payer who is not the delegator: paying rent and
+/// granting are different roles, and keeping them different keys in every test means a handler
+/// that conflated them would fail here. The delegator is a wallet key, on the curve, because
+/// the host treats wallet and PDA delegators differently.
+struct Actors {
+    payer: Pubkey,
+    delegator: Pubkey,
+    delegate: Pubkey,
+    app: AppScope,
+    record_key: Pubkey,
+    record_bump: u8,
+}
+
+fn app() -> AppScope {
+    AppScope {
+        program: Pubkey::new_unique(),
+        scope: Pubkey::new_from_array([0x5c; 32]),
+    }
+}
+
+/// The account a grant's scope names: owned by the application's program, as the grant requires,
+/// or absent for the wildcard row.
+fn scope_account(app: AppScope) -> (Pubkey, Account) {
+    let account = if app == AppScope::WILDCARD {
+        empty_system_account()
+    } else {
+        program_owned_account(app.program)
+    };
+    (app.scope, account)
+}
+
+fn actors() -> Actors {
+    let delegator = Keypair::new().pubkey();
+    let delegate = Keypair::new().pubkey();
+    let app = app();
+    let (record_key, record_bump) =
+        host::user_decryption_delegation_address(delegator, delegate, app);
+    Actors {
+        payer: Pubkey::new_unique(),
+        delegator,
+        delegate,
+        app,
+        record_key,
+        record_bump,
+    }
+}
+
+/// A live record of the actors' tuple, written at [`EARLIER_SLOT`] with counter 1 — what the
+/// first grant produces, aged by one re-grantable slot gap.
+fn live_record(actors: &Actors) -> UserDecryptionDelegation {
+    UserDecryptionDelegation {
+        delegator: actors.delegator,
+        delegate: actors.delegate,
+        program: actors.app.program,
+        scope: actors.app.scope,
+        expires_at: EXPIRES_AT,
+        delegation_counter: 1,
+        last_update_slot: EARLIER_SLOT,
+        bump: actors.record_bump,
+    }
+}
+
+fn record_account(record: &UserDecryptionDelegation) -> Account {
+    Account {
+        lamports: 1_000_000_000,
+        data: serialized(record.clone()),
+        owner: host::id(),
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+/// The six accounts a grant takes, with the record slot holding `record_account`.
+fn grant_accounts(actors: &Actors, record: Account, paused: bool) -> Vec<(Pubkey, Account)> {
+    let (host_config, host_config_account) = host_config_account(paused);
+    vec![
+        (actors.payer, funded_wallet()),
+        (actors.delegator, funded_wallet()),
+        (host_config, host_config_account),
+        (actors.record_key, record),
+        (system_program::ID, system_program_account()),
+        scope_account(actors.app),
+    ]
+}
+
+/// The three accounts a revoke takes.
+fn revoke_accounts(actors: &Actors, record: Account, paused: bool) -> Vec<(Pubkey, Account)> {
+    let (host_config, host_config_account) = host_config_account(paused);
+    vec![
+        (actors.delegator, funded_wallet()),
+        (host_config, host_config_account),
+        (actors.record_key, record),
+    ]
+}
+
+fn decode_record(data: &[u8]) -> UserDecryptionDelegation {
+    let mut slice: &[u8] = data;
+    UserDecryptionDelegation::try_deserialize(&mut slice)
+        .expect("the resulting account decodes as a delegation record")
+}
+
+// ---------------------------------------------------------------------------
+// Grant
+// ---------------------------------------------------------------------------
+
+/// The first grant creates the record at the canonical PDA and writes every field the
+/// Connector will later read. The payer is not the delegator: rent and consent are separate
+/// roles.
+#[test]
+fn a_grant_creates_the_record_at_the_canonical_pda() {
+    let actors = actors();
+    let accounts = grant_accounts(&actors, empty_system_account(), false);
+
+    let result = mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            actors.record_key,
+            actors.delegate,
+            actors.app,
+            EXPIRES_AT,
+        ),
+        &accounts,
+        &[Check::success()],
+    );
+
+    let created = result
+        .get_account(&actors.record_key)
+        .expect("the record exists after the grant");
+    assert_eq!(created.owner, host::id(), "the record is program-owned");
+    assert_eq!(
+        created.data.len(),
+        8 + UserDecryptionDelegation::SPACE,
+        "the record is exactly the declared size"
+    );
+    assert_eq!(
+        &created.data[..8],
+        UserDecryptionDelegation::DISCRIMINATOR,
+        "the record carries the delegation discriminator"
+    );
+    let record = decode_record(&created.data);
+    assert_eq!(record.delegator, actors.delegator);
+    assert_eq!(record.delegate, actors.delegate);
+    assert_eq!(record.program, actors.app.program);
+    assert_eq!(record.scope, actors.app.scope);
+    assert_eq!(record.expires_at, EXPIRES_AT);
+    assert_eq!(record.delegation_counter, 1, "the first grant counts one");
+    assert_eq!(record.last_update_slot, CURRENT_SLOT);
+    assert_eq!(record.bump, actors.record_bump);
+}
+
+/// The common wallet path: one key pays and grants. The instruction then carries the same
+/// pubkey as two metas — a writable signer (payer) and a readonly signer (delegator) — which
+/// is exactly the account-dedup shape a runtime or framework regression would trip on, and
+/// which every other test here misses on purpose (they split the roles to catch conflation).
+#[test]
+fn a_grant_whose_payer_is_the_delegator_creates_the_record() {
+    let actors = actors();
+    let (host_config, host_config_acc) = host_config_account(false);
+
+    let result = mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.delegator,
+            actors.delegator,
+            actors.record_key,
+            actors.delegate,
+            actors.app,
+            EXPIRES_AT,
+        ),
+        &[
+            (actors.delegator, funded_wallet()),
+            (host_config, host_config_acc),
+            (actors.record_key, empty_system_account()),
+            (system_program::ID, system_program_account()),
+            scope_account(actors.app),
+        ],
+        &[Check::success()],
+    );
+
+    let created = result
+        .get_account(&actors.record_key)
+        .expect("the record exists after the self-paid grant");
+    let record = decode_record(&created.data);
+    assert_eq!(record.delegator, actors.delegator);
+    assert_eq!(record.delegation_counter, 1);
+}
+
+/// The record's seeds are public, so a third party can pre-fund the address with a bare
+/// transfer before the delegator's first grant. The creation path tolerates the donation
+/// (fund/allocate/assign, not `create_account`) — otherwise a dusting transfer would block the
+/// tuple's delegation permanently.
+#[test]
+fn a_grant_survives_a_record_address_prefunded_by_a_third_party() {
+    let actors = actors();
+    let prefunded = Account {
+        lamports: 5_000_000_000,
+        data: vec![],
+        owner: system_program::ID,
+        executable: false,
+        rent_epoch: 0,
+    };
+    let accounts = grant_accounts(&actors, prefunded, false);
+
+    let result = mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            actors.record_key,
+            actors.delegate,
+            actors.app,
+            EXPIRES_AT,
+        ),
+        &accounts,
+        &[Check::success()],
+    );
+
+    let created = result
+        .get_account(&actors.record_key)
+        .expect("the record exists after the grant");
+    assert_eq!(
+        created.owner,
+        host::id(),
+        "the donation did not block adoption"
+    );
+    let record = decode_record(&created.data);
+    assert_eq!(
+        record.delegation_counter, 1,
+        "this is a first grant, not a re-grant"
+    );
+    assert!(
+        created.lamports >= 5_000_000_000,
+        "the donation stays on the record (more-than-rent-exempt is harmless)"
+    );
+}
+
+/// An account owned by another program squatting the canonical record address cannot be
+/// adopted: the grant refuses instead of writing a record over foreign bytes or trusting
+/// whatever they hold.
+#[test]
+fn a_grant_refuses_a_record_address_owned_by_a_foreign_program() {
+    let actors = actors();
+    let foreign = Account {
+        lamports: 1_000_000_000,
+        data: vec![0; 16],
+        owner: Pubkey::new_unique(),
+        executable: false,
+        rent_epoch: 0,
+    };
+    let accounts = grant_accounts(&actors, foreign, false);
+
+    mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            actors.record_key,
+            actors.delegate,
+            actors.app,
+            EXPIRES_AT,
+        ),
+        &accounts,
+        &[anchor_framework_error_check(
+            anchor_lang::error::ErrorCode::AccountOwnedByWrongProgram,
+        )],
+    );
+}
+
+/// A grant over the wildcard application is legal and writes an ordinary record: the delegator's
+/// grant across every application. The sentinel is refused only in the delegate position — a
+/// real party has to be named on the receiving end.
+#[test]
+fn a_wildcard_grant_is_legal_and_writes_the_record() {
+    let delegator = Keypair::new().pubkey();
+    let delegate = Keypair::new().pubkey();
+    let (record_key, _) =
+        host::user_decryption_delegation_address(delegator, delegate, AppScope::WILDCARD);
+    let payer = Pubkey::new_unique();
+    let (host_config, host_config_acc) = host_config_account(false);
+
+    let result = mollusk().process_and_validate_instruction(
+        &grant_ix(
+            payer,
+            delegator,
+            record_key,
+            delegate,
+            AppScope::WILDCARD,
+            EXPIRES_AT,
+        ),
+        &[
+            (payer, funded_wallet()),
+            (delegator, funded_wallet()),
+            (host_config, host_config_acc),
+            (record_key, empty_system_account()),
+            (system_program::ID, system_program_account()),
+            scope_account(AppScope::WILDCARD),
+        ],
+        &[Check::success()],
+    );
+
+    let record = decode_record(&result.get_account(&record_key).expect("record").data);
+    assert_eq!(record.program.to_bytes(), host::WILDCARD_APP);
+    assert_eq!(record.scope.to_bytes(), host::WILDCARD_APP);
+    assert_eq!(record.delegation_counter, 1);
+}
+
+/// The sentinel fills the whole application or none of it. A half-wildcard would be a second
+/// spelling of "every application" that no reader looks up.
+#[test]
+fn a_half_wildcard_grant_is_rejected() {
+    let actors = actors();
+    let wildcard_program = Pubkey::new_from_array(host::WILDCARD_APP);
+    let halves = [
+        AppScope {
+            program: wildcard_program,
+            scope: actors.app.scope,
+        },
+        AppScope {
+            program: actors.app.program,
+            scope: wildcard_program,
+        },
+    ];
+
+    for app in halves {
+        let (record_key, _) =
+            host::user_decryption_delegation_address(actors.delegator, actors.delegate, app);
+        let mut accounts = grant_accounts(&actors, empty_system_account(), false);
+        accounts[3].0 = record_key;
+        accounts[5] = scope_account(app);
+
+        mollusk().process_and_validate_instruction(
+            &grant_ix(
+                actors.payer,
+                actors.delegator,
+                record_key,
+                actors.delegate,
+                app,
+                EXPIRES_AT,
+            ),
+            &accounts,
+            &[custom_error(host::errors::ZamaHostError::InvalidDelegation)],
+        );
+    }
+}
+
+/// A grant's scope must be an account of its program, the rule `create_encrypted_store` applies,
+/// so a grant never names an application no store can have. Refused: another program's account,
+/// the program's own id (owned by the loader), and an absent address (System-owned).
+#[test]
+fn a_grant_whose_scope_its_program_does_not_own_is_rejected() {
+    let actors = actors();
+    let not_the_programs = [
+        program_owned_account(Pubkey::new_unique()),
+        program_owned_account(anchor_lang::solana_program::bpf_loader_upgradeable::ID),
+        empty_system_account(),
+    ];
+
+    for scope_account in not_the_programs {
+        let mut accounts = grant_accounts(&actors, empty_system_account(), false);
+        accounts[5].1 = scope_account;
+
+        mollusk().process_and_validate_instruction(
+            &grant_ix(
+                actors.payer,
+                actors.delegator,
+                actors.record_key,
+                actors.delegate,
+                actors.app,
+                EXPIRES_AT,
+            ),
+            &accounts,
+            &[custom_error(
+                host::errors::ZamaHostError::DelegationScopeNotProgramAccount,
+            )],
+        );
+    }
+}
+
+/// A default delegate names nobody.
+#[test]
+fn a_grant_to_the_default_pubkey_is_rejected() {
+    let actors = actors();
+    let (record_key, _) =
+        host::user_decryption_delegation_address(actors.delegator, Pubkey::default(), actors.app);
+    let mut accounts = grant_accounts(&actors, empty_system_account(), false);
+    accounts[3].0 = record_key;
+
+    mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            record_key,
+            Pubkey::default(),
+            actors.app,
+            EXPIRES_AT,
+        ),
+        &accounts,
+        &[custom_error(host::errors::ZamaHostError::InvalidDelegation)],
+    );
+}
+
+/// No encrypted store belongs to the default program, so a grant over it scopes nothing.
+#[test]
+fn a_grant_over_the_default_program_is_rejected() {
+    let actors = actors();
+    let app = AppScope {
+        program: Pubkey::default(),
+        scope: actors.app.scope,
+    };
+    let (record_key, _) =
+        host::user_decryption_delegation_address(actors.delegator, actors.delegate, app);
+    let mut accounts = grant_accounts(&actors, empty_system_account(), false);
+    accounts[3].0 = record_key;
+
+    mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            record_key,
+            actors.delegate,
+            app,
+            EXPIRES_AT,
+        ),
+        &accounts,
+        &[custom_error(host::errors::ZamaHostError::InvalidDelegation)],
+    );
+}
+
+/// The sentinel is refused in the delegate position: "everyone" cannot be a delegate, only an
+/// application.
+#[test]
+fn a_grant_to_the_wildcard_sentinel_is_rejected() {
+    let actors = actors();
+    let wildcard = Pubkey::new_from_array(host::WILDCARD_APP);
+    let (record_key, _) =
+        host::user_decryption_delegation_address(actors.delegator, wildcard, actors.app);
+    let mut accounts = grant_accounts(&actors, empty_system_account(), false);
+    accounts[3].0 = record_key;
+
+    mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            record_key,
+            wildcard,
+            actors.app,
+            EXPIRES_AT,
+        ),
+        &accounts,
+        &[custom_error(host::errors::ZamaHostError::InvalidDelegation)],
+    );
+}
+
+/// A delegate decrypts by signing a request off chain, so it must be a keypair's key. A PDA
+/// delegate could never use the grant.
+#[test]
+fn a_grant_to_a_program_derived_address_is_rejected() {
+    let actors = actors();
+    let (pda, _) = Pubkey::find_program_address(&[b"vault"], &actors.app.program);
+    assert!(!pda.is_on_curve());
+    let (record_key, _) =
+        host::user_decryption_delegation_address(actors.delegator, pda, actors.app);
+    let mut accounts = grant_accounts(&actors, empty_system_account(), false);
+    accounts[3].0 = record_key;
+
+    mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            record_key,
+            pda,
+            actors.app,
+            EXPIRES_AT,
+        ),
+        &accounts,
+        &[custom_error(host::errors::ZamaHostError::InvalidDelegation)],
+    );
+}
+
+/// EVM's `SenderCannotBeDelegate`, `SenderCannotBeContractAddress` and
+/// `DelegateCannotBeContractAddress`, with the application's program as the contract.
+#[test]
+fn a_grant_between_overlapping_parties_is_rejected() {
+    let actors = actors();
+    let overlaps = [
+        (actors.delegator, actors.app.program), // delegate == delegator
+        (actors.delegate, actors.delegator),    // program == delegator
+        (actors.delegate, actors.delegate),     // program == delegate
+    ];
+
+    for (delegate, program) in overlaps {
+        let app = AppScope {
+            program,
+            scope: actors.app.scope,
+        };
+        let (record_key, _) =
+            host::user_decryption_delegation_address(actors.delegator, delegate, app);
+        let mut accounts = grant_accounts(&actors, empty_system_account(), false);
+        accounts[3].0 = record_key;
+
+        mollusk().process_and_validate_instruction(
+            &grant_ix(
+                actors.payer,
+                actors.delegator,
+                record_key,
+                delegate,
+                app,
+                EXPIRES_AT,
+            ),
+            &accounts,
+            &[custom_error(host::errors::ZamaHostError::InvalidDelegation)],
+        );
+    }
+}
+
+/// The expiry must lie strictly after the current second, as EVM's `ExpirationDateInThePast`
+/// requires: a grant ending now is dead on arrival, and one ending a second later is live.
+#[test]
+fn a_grant_must_expire_after_now() {
+    let actors = actors();
+
+    mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            actors.record_key,
+            actors.delegate,
+            actors.app,
+            NOW,
+        ),
+        &grant_accounts(&actors, empty_system_account(), false),
+        &[custom_error(host::errors::ZamaHostError::InvalidDelegation)],
+    );
+
+    let result = mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            actors.record_key,
+            actors.delegate,
+            actors.app,
+            NOW + 1,
+        ),
+        &grant_accounts(&actors, empty_system_account(), false),
+        &[Check::success()],
+    );
+    let record = decode_record(&result.get_account(&actors.record_key).expect("record").data);
+    assert_eq!(record.expires_at, NOW + 1);
+}
+
+/// Granting is pause-gated.
+#[test]
+fn a_grant_while_paused_is_rejected() {
+    let actors = actors();
+    let accounts = grant_accounts(&actors, empty_system_account(), true);
+
+    mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            actors.record_key,
+            actors.delegate,
+            actors.app,
+            EXPIRES_AT,
+        ),
+        &accounts,
+        &[custom_error(host::errors::ZamaHostError::AclWritesPaused)],
+    );
+}
+
+/// The account list is closed: an extra account is refused rather than ignored, so nothing
+/// can be smuggled in for a future handler change to trip over.
+#[test]
+fn a_grant_with_remaining_accounts_is_rejected() {
+    let actors = actors();
+    let stowaway = Pubkey::new_unique();
+    let mut accounts = grant_accounts(&actors, empty_system_account(), false);
+    accounts.push((stowaway, funded_wallet()));
+    let mut instruction = grant_ix(
+        actors.payer,
+        actors.delegator,
+        actors.record_key,
+        actors.delegate,
+        actors.app,
+        EXPIRES_AT,
+    );
+    instruction
+        .accounts
+        .push(AccountMeta::new_readonly(stowaway, false));
+
+    mollusk().process_and_validate_instruction(
+        &instruction,
+        &accounts,
+        &[custom_error(
+            host::errors::ZamaHostError::UnexpectedRemainingAccounts,
+        )],
+    );
+}
+
+/// A record account at any address other than the canonical PDA of the granted tuple is
+/// refused: the address is derived, never trusted from the caller.
+#[test]
+fn a_grant_into_a_non_canonical_address_is_rejected() {
+    let actors = actors();
+    let elsewhere = Pubkey::new_unique();
+    let mut accounts = grant_accounts(&actors, empty_system_account(), false);
+    accounts[3].0 = elsewhere;
+
+    mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            elsewhere,
+            actors.delegate,
+            actors.app,
+            EXPIRES_AT,
+        ),
+        &accounts,
+        &[Check::err(
+            anchor_lang::solana_program::program_error::ProgramError::Custom(
+                anchor_lang::error::ErrorCode::ConstraintSeeds as u32,
+            ),
+        )],
+    );
+}
+
+/// The delegator must sign. Without this, anyone could grant delegations away from anyone.
+#[test]
+fn a_grant_requires_the_delegators_signature() {
+    let actors = actors();
+    let accounts = grant_accounts(&actors, empty_system_account(), false);
+    let mut instruction = grant_ix(
+        actors.payer,
+        actors.delegator,
+        actors.record_key,
+        actors.delegate,
+        actors.app,
+        EXPIRES_AT,
+    );
+    // The delegator is the second account of the instruction; clear its signer flag.
+    instruction.accounts[1] = AccountMeta::new_readonly(actors.delegator, false);
+
+    let result = mollusk().process_instruction(&instruction, &accounts);
+    assert!(
+        result.program_result.is_err(),
+        "an unsigned grant must fail"
+    );
+}
+
+/// A grant handed a foreign account in the host-config position is refused by the config's
+/// own discriminator — a delegation record is program-owned too, which is exactly why the
+/// discriminator has to be the thing checked.
+#[test]
+fn a_grant_with_a_substituted_host_config_is_rejected() {
+    let actors = actors();
+    let record = live_record(&actors);
+    let (host_config, _) = host::host_config_address();
+    let accounts = vec![
+        (actors.payer, funded_wallet()),
+        (actors.delegator, funded_wallet()),
+        // The delegation record itself, standing where the config should be.
+        (host_config, record_account(&record)),
+        (actors.record_key, empty_system_account()),
+        (system_program::ID, system_program_account()),
+        scope_account(actors.app),
+    ];
+
+    mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            actors.record_key,
+            actors.delegate,
+            actors.app,
+            EXPIRES_AT,
+        ),
+        &accounts,
+        &[anchor_framework_error_check(
+            anchor_lang::error::ErrorCode::AccountDiscriminatorMismatch,
+        )],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Re-grant
+// ---------------------------------------------------------------------------
+
+/// A re-grant rewrites the expiration, counts one more, and stamps the current slot.
+#[test]
+fn a_regrant_increments_the_counter_and_rewrites_the_fields() {
+    let actors = actors();
+    let existing = live_record(&actors);
+    let accounts = grant_accounts(&actors, record_account(&existing), false);
+    let new_expires_at = EXPIRES_AT + 100;
+
+    let result = mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            actors.record_key,
+            actors.delegate,
+            actors.app,
+            new_expires_at,
+        ),
+        &accounts,
+        &[Check::success()],
+    );
+
+    let record = decode_record(&result.get_account(&actors.record_key).expect("record").data);
+    assert_eq!(record.expires_at, new_expires_at);
+    assert_eq!(record.delegation_counter, 2, "a re-grant counts one more");
+    assert_eq!(record.last_update_slot, CURRENT_SLOT);
+}
+
+/// A record mutates at most once per slot — that is what makes every
+/// `(delegation_counter, last_update_slot)` pair unambiguous to an off-chain reader.
+#[test]
+fn a_regrant_in_the_records_own_update_slot_is_rejected() {
+    let actors = actors();
+    let mut existing = live_record(&actors);
+    existing.last_update_slot = CURRENT_SLOT;
+    let accounts = grant_accounts(&actors, record_account(&existing), false);
+
+    mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            actors.record_key,
+            actors.delegate,
+            actors.app,
+            EXPIRES_AT + 100,
+        ),
+        &accounts,
+        &[custom_error(
+            host::errors::ZamaHostError::DelegationUpdatedInCurrentSlot,
+        )],
+    );
+}
+
+/// A re-grant that changes nothing is refused: a no-op write would still bump the counter
+/// and the update slot, spending the once-per-slot budget on nothing.
+#[test]
+fn a_regrant_with_the_same_expiration_is_rejected() {
+    let actors = actors();
+    let existing = live_record(&actors);
+    let accounts = grant_accounts(&actors, record_account(&existing), false);
+
+    mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            actors.record_key,
+            actors.delegate,
+            actors.app,
+            EXPIRES_AT,
+        ),
+        &accounts,
+        &[custom_error(host::errors::ZamaHostError::InvalidDelegation)],
+    );
+}
+
+/// Re-granting a revoked record reinstates it. The counter still moves, so the two states are
+/// never confusable.
+#[test]
+fn a_regrant_after_revocation_reinstates_the_delegation() {
+    let actors = actors();
+    let mut revoked = live_record(&actors);
+    revoked.expires_at = 0;
+    revoked.delegation_counter = 2;
+    let accounts = grant_accounts(&actors, record_account(&revoked), false);
+
+    let result = mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            actors.record_key,
+            actors.delegate,
+            actors.app,
+            EXPIRES_AT,
+        ),
+        &accounts,
+        &[Check::success()],
+    );
+
+    let record = decode_record(&result.get_account(&actors.record_key).expect("record").data);
+    assert_eq!(record.expires_at, EXPIRES_AT);
+    assert_eq!(record.delegation_counter, 3);
+}
+
+/// A counter at the maximum cannot move, so the record cannot be re-granted. Unreachable in
+/// practice — the counter moves at most once per slot — but the refusal is a statement that
+/// the counter never wraps, which the off-chain freshness contract relies on.
+#[test]
+fn a_counter_at_the_maximum_cannot_be_regranted() {
+    let actors = actors();
+    let mut existing = live_record(&actors);
+    existing.delegation_counter = u64::MAX;
+    let accounts = grant_accounts(&actors, record_account(&existing), false);
+
+    mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            actors.record_key,
+            actors.delegate,
+            actors.app,
+            EXPIRES_AT + 100,
+        ),
+        &accounts,
+        &[custom_error(host::errors::ZamaHostError::InvalidDelegation)],
+    );
+}
+
+/// A program-owned account of the wrong size at the record address is not a delegation
+/// record, whatever its first bytes say.
+#[test]
+fn an_existing_record_of_the_wrong_size_is_rejected() {
+    let actors = actors();
+    let mut truncated = record_account(&live_record(&actors));
+    truncated.data.truncate(truncated.data.len() - 1);
+    let accounts = grant_accounts(&actors, truncated, false);
+
+    mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            actors.record_key,
+            actors.delegate,
+            actors.app,
+            EXPIRES_AT + 100,
+        ),
+        &accounts,
+        &[anchor_framework_error_check(
+            anchor_lang::error::ErrorCode::AccountDidNotDeserialize,
+        )],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Revoke
+// ---------------------------------------------------------------------------
+
+/// Revocation zeroes the expiry, counts one more and stamps the slot. A revoked record then
+/// reads like one never granted, as on EVM.
+#[test]
+fn a_revocation_zeroes_the_expiry() {
+    let actors = actors();
+    let existing = live_record(&actors);
+    let accounts = revoke_accounts(&actors, record_account(&existing), false);
+
+    let result = mollusk().process_and_validate_instruction(
+        &revoke_ix(actors.delegator, actors.record_key),
+        &accounts,
+        &[Check::success()],
+    );
+
+    let record = decode_record(&result.get_account(&actors.record_key).expect("record").data);
+    assert_eq!(record.expires_at, 0);
+    assert_eq!(record.delegation_counter, 2);
+    assert_eq!(record.last_update_slot, CURRENT_SLOT);
+}
+
+/// Only the delegator can revoke — not the delegate, and not a stranger.
+#[test]
+fn a_stranger_cannot_revoke_a_delegation_they_did_not_grant() {
+    let actors = actors();
+    let existing = live_record(&actors);
+    let stranger = Pubkey::new_unique();
+    let (host_config, host_config_acc) = host_config_account(false);
+    let accounts = vec![
+        (stranger, funded_wallet()),
+        (host_config, host_config_acc),
+        (actors.record_key, record_account(&existing)),
+    ];
+
+    mollusk().process_and_validate_instruction(
+        &revoke_ix(stranger, actors.record_key),
+        &accounts,
+        &[custom_error(host::errors::ZamaHostError::InvalidDelegation)],
+    );
+}
+
+/// A second revocation is refused rather than absorbed, as EVM's `NotDelegatedYet`: the counter
+/// must not move for a state that did not change.
+#[test]
+fn a_second_revocation_is_rejected() {
+    let actors = actors();
+    let mut revoked = live_record(&actors);
+    revoked.expires_at = 0;
+    let accounts = revoke_accounts(&actors, record_account(&revoked), false);
+
+    mollusk().process_and_validate_instruction(
+        &revoke_ix(actors.delegator, actors.record_key),
+        &accounts,
+        &[custom_error(host::errors::ZamaHostError::NotDelegatedYet)],
+    );
+}
+
+/// There is nothing to revoke at an address no grant created.
+#[test]
+fn a_revocation_of_a_record_never_granted_is_rejected() {
+    let actors = actors();
+    let accounts = revoke_accounts(&actors, empty_system_account(), false);
+
+    mollusk().process_and_validate_instruction(
+        &revoke_ix(actors.delegator, actors.record_key),
+        &accounts,
+        &[anchor_framework_error_check(
+            anchor_lang::error::ErrorCode::AccountNotInitialized,
+        )],
+    );
+}
+
+/// The once-per-slot guard holds for revocation too.
+#[test]
+fn a_revocation_in_the_records_own_update_slot_is_rejected() {
+    let actors = actors();
+    let mut existing = live_record(&actors);
+    existing.last_update_slot = CURRENT_SLOT;
+    let accounts = revoke_accounts(&actors, record_account(&existing), false);
+
+    mollusk().process_and_validate_instruction(
+        &revoke_ix(actors.delegator, actors.record_key),
+        &accounts,
+        &[custom_error(
+            host::errors::ZamaHostError::DelegationUpdatedInCurrentSlot,
+        )],
+    );
+}
+
+/// A well-formed record sitting at a non-canonical address is refused: the expected address
+/// is re-derived from the record's own tuple and has to match the account handed in.
+#[test]
+fn a_revocation_of_a_record_at_a_non_canonical_address_is_rejected() {
+    let actors = actors();
+    let existing = live_record(&actors);
+    let elsewhere = Pubkey::new_unique();
+    let (host_config, host_config_acc) = host_config_account(false);
+    let accounts = vec![
+        (actors.delegator, funded_wallet()),
+        (host_config, host_config_acc),
+        (elsewhere, record_account(&existing)),
+    ];
+
+    mollusk().process_and_validate_instruction(
+        &revoke_ix(actors.delegator, elsewhere),
+        &accounts,
+        &[Check::err(
+            anchor_lang::solana_program::program_error::ProgramError::Custom(
+                anchor_lang::error::ErrorCode::ConstraintSeeds as u32,
+            ),
+        )],
+    );
+}
+
+/// A stored bump other than the canonical one is refused on revocation too.
+#[test]
+fn a_record_with_a_non_canonical_bump_is_rejected_on_revocation() {
+    let actors = actors();
+    let mut existing = live_record(&actors);
+    existing.bump = actors.record_bump.wrapping_sub(1);
+    let accounts = revoke_accounts(&actors, record_account(&existing), false);
+
+    mollusk().process_and_validate_instruction(
+        &revoke_ix(actors.delegator, actors.record_key),
+        &accounts,
+        &[Check::err(
+            anchor_lang::solana_program::program_error::ProgramError::Custom(
+                anchor_lang::error::ErrorCode::ConstraintSeeds as u32,
+            ),
+        )],
+    );
+}
+
+/// Revocation is paused with the other ACL writes, as EVM's `whenNotPaused` revocation is.
+#[test]
+fn a_revocation_while_paused_is_rejected() {
+    let actors = actors();
+    let existing = live_record(&actors);
+    let accounts = revoke_accounts(&actors, record_account(&existing), true);
+
+    mollusk().process_and_validate_instruction(
+        &revoke_ix(actors.delegator, actors.record_key),
+        &accounts,
+        &[custom_error(host::errors::ZamaHostError::AclWritesPaused)],
+    );
+}
+
+/// Delegation is paused only with the ACL writes: pausing execution and verified inputs leaves
+/// both grant and revocation running.
+#[test]
+fn a_grant_and_a_revocation_run_while_the_other_areas_are_paused() {
+    let actors = actors();
+    let other_areas = host::PauseFlags {
+        acl_writes: false,
+        ..host::PauseFlags::ALL
+    };
+    let pause_other_areas = |mut accounts: Vec<(Pubkey, Account)>| {
+        let host_config = host::host_config_address().0;
+        let (_, config) = accounts
+            .iter_mut()
+            .find(|(key, _)| *key == host_config)
+            .expect("host config");
+        *config = paused_host_config(config, other_areas);
+        accounts
+    };
+
+    mollusk().process_and_validate_instruction(
+        &grant_ix(
+            actors.payer,
+            actors.delegator,
+            actors.record_key,
+            actors.delegate,
+            actors.app,
+            EXPIRES_AT,
+        ),
+        &pause_other_areas(grant_accounts(&actors, empty_system_account(), false)),
+        &[Check::success()],
+    );
+    let existing = live_record(&actors);
+    mollusk().process_and_validate_instruction(
+        &revoke_ix(actors.delegator, actors.record_key),
+        &pause_other_areas(revoke_accounts(&actors, record_account(&existing), false)),
+        &[Check::success()],
+    );
+}
+
+/// The revoke account list is closed too.
+#[test]
+fn a_revocation_with_remaining_accounts_is_rejected() {
+    let actors = actors();
+    let existing = live_record(&actors);
+    let stowaway = Pubkey::new_unique();
+    let mut accounts = revoke_accounts(&actors, record_account(&existing), false);
+    accounts.push((stowaway, funded_wallet()));
+    let mut instruction = revoke_ix(actors.delegator, actors.record_key);
+    instruction
+        .accounts
+        .push(AccountMeta::new_readonly(stowaway, false));
+
+    mollusk().process_and_validate_instruction(
+        &instruction,
+        &accounts,
+        &[custom_error(
+            host::errors::ZamaHostError::UnexpectedRemainingAccounts,
+        )],
+    );
+}
+
+/// The delegator must sign the revocation.
+#[test]
+fn a_revocation_requires_the_delegators_signature() {
+    let actors = actors();
+    let existing = live_record(&actors);
+    let accounts = revoke_accounts(&actors, record_account(&existing), false);
+    let mut instruction = revoke_ix(actors.delegator, actors.record_key);
+    instruction.accounts[0] = AccountMeta::new_readonly(actors.delegator, false);
+
+    let result = mollusk().process_instruction(&instruction, &accounts);
+    assert!(
+        result.program_result.is_err(),
+        "an unsigned revocation must fail"
+    );
+}
+
+/// The role-for-role substitution matrix: each program-owned account of this instruction
+/// pair, standing in the other's position, is refused by a discriminator check rather than
+/// misread. Both accounts are owned by the same program, which is exactly why ownership
+/// alone would not be enough.
+#[test]
+fn substituted_program_accounts_are_refused_by_their_discriminators() {
+    let actors = actors();
+    let (host_config, host_config_acc) = host_config_account(false);
+
+    // The host config, standing where the delegation record should be.
+    let record_position = vec![
+        (actors.delegator, funded_wallet()),
+        (host_config, host_config_acc.clone()),
+        (actors.record_key, host_config_acc.clone()),
+    ];
+    mollusk().process_and_validate_instruction(
+        &revoke_ix(actors.delegator, actors.record_key),
+        &record_position,
+        &[anchor_framework_error_check(
+            anchor_lang::error::ErrorCode::AccountDiscriminatorMismatch,
+        )],
+    );
+
+    // The delegation record, standing where the host config should be.
+    let config_position = vec![
+        (actors.delegator, funded_wallet()),
+        (host_config, record_account(&live_record(&actors))),
+        (actors.record_key, record_account(&live_record(&actors))),
+    ];
+    mollusk().process_and_validate_instruction(
+        &revoke_ix(actors.delegator, actors.record_key),
+        &config_position,
+        &[anchor_framework_error_check(
+            anchor_lang::error::ErrorCode::AccountDiscriminatorMismatch,
+        )],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A program-controlled delegator
+// ---------------------------------------------------------------------------
+
+/// A runtime holding both the wrapper and the host, at [`CURRENT_SLOT`] and [`NOW`].
+fn mollusk_with_vault() -> Mollusk {
+    let mut mollusk = host_fixtures::vault_and_host_svm();
+    mollusk.sysvars.clock.slot = CURRENT_SLOT;
+    mollusk.sysvars.clock.unix_timestamp = NOW as i64;
+    mollusk
+}
+
+/// The accounts of one vault-delegated tuple: the executor's vault PDA is the delegator, and
+/// the record address is derived from it exactly as from a wallet.
+struct VaultActors {
+    executor: Pubkey,
+    vault: Pubkey,
+    delegate: Pubkey,
+    app: AppScope,
+    record_key: Pubkey,
+}
+
+fn vault_actors() -> VaultActors {
+    let executor = Pubkey::new_unique();
+    let (vault_pda, _) = vault::vault_address(executor);
+    let delegate = Keypair::new().pubkey();
+    let app = app();
+    let (record_key, _) = host::user_decryption_delegation_address(vault_pda, delegate, app);
+    VaultActors {
+        executor,
+        vault: vault_pda,
+        delegate,
+        app,
+        record_key,
+    }
+}
+
+fn vault_accounts(actors: &VaultActors, record: Account) -> Vec<(Pubkey, Account)> {
+    let (host_config, host_config_account) = host_config_account(false);
+    vec![
+        (actors.executor, funded_wallet()),
+        (actors.vault, empty_system_account()),
+        (host_config, host_config_account),
+        (actors.record_key, record),
+        (host::id(), host_program_account()),
+        (system_program::ID, system_program_account()),
+        scope_account(actors.app),
+    ]
+}
+
+fn grant_via_vault_ix(actors: &VaultActors, expires_at: u64) -> Instruction {
+    let (host_config, _) = host::host_config_address();
+    zama_solana_test_kit::anchor_ix(
+        vault::id(),
+        vault::accounts::VaultDelegation {
+            executor: actors.executor,
+            vault: actors.vault,
+            host_config,
+            scope: actors.app.scope,
+            delegation_record: actors.record_key,
+            zama_host: host::id(),
+            system_program: system_program::ID,
+        },
+        vault::instruction::GrantViaVault {
+            delegate: actors.delegate,
+            program: actors.app.program,
+            expires_at,
+        },
+    )
+}
+
+fn revoke_via_vault_ix(actors: &VaultActors) -> Instruction {
+    let (host_config, _) = host::host_config_address();
+    zama_solana_test_kit::anchor_ix(
+        vault::id(),
+        vault::accounts::VaultDelegation {
+            executor: actors.executor,
+            vault: actors.vault,
+            host_config,
+            scope: actors.app.scope,
+            delegation_record: actors.record_key,
+            zama_host: host::id(),
+            system_program: system_program::ID,
+        },
+        vault::instruction::RevokeViaVault {},
+    )
+}
+
+/// The Squads-model evidence, reduced to what the host actually verifies: the delegator is a
+/// PDA of another program, no private key exists for it, and the grant lands because
+/// `invoke_signed` satisfies the host's `delegator: Signer`. The record is indistinguishable
+/// from a wallet's — the Connector needs no notion of "program-controlled" at all.
+#[test]
+fn a_vault_pda_grants_a_delegation_via_cpi() {
+    let actors = vault_actors();
+    let accounts = vault_accounts(&actors, empty_system_account());
+
+    let result = mollusk_with_vault().process_and_validate_instruction(
+        &grant_via_vault_ix(&actors, EXPIRES_AT),
+        &accounts,
+        &[Check::success()],
+    );
+
+    let record = decode_record(&result.get_account(&actors.record_key).expect("record").data);
+    assert_eq!(
+        record.delegator, actors.vault,
+        "the delegator is the vault PDA, not the executor"
+    );
+    assert_eq!(record.delegate, actors.delegate);
+    assert_eq!(record.program, actors.app.program);
+    assert_eq!(record.scope, actors.app.scope);
+    assert_eq!(record.delegation_counter, 1);
+}
+
+/// The vault revokes what it granted, through the same seeds.
+#[test]
+fn a_vault_pda_revokes_its_delegation_via_cpi() {
+    let actors = vault_actors();
+    let (_, record_bump) =
+        host::user_decryption_delegation_address(actors.vault, actors.delegate, actors.app);
+    let existing = UserDecryptionDelegation {
+        delegator: actors.vault,
+        delegate: actors.delegate,
+        program: actors.app.program,
+        scope: actors.app.scope,
+        expires_at: EXPIRES_AT,
+        delegation_counter: 1,
+        last_update_slot: EARLIER_SLOT,
+        bump: record_bump,
+    };
+    let accounts = vault_accounts(&actors, record_account(&existing));
+
+    let result = mollusk_with_vault().process_and_validate_instruction(
+        &revoke_via_vault_ix(&actors),
+        &accounts,
+        &[Check::success()],
+    );
+
+    let record = decode_record(&result.get_account(&actors.record_key).expect("record").data);
+    assert_eq!(record.expires_at, 0);
+    assert_eq!(record.delegation_counter, 2);
+}
+
+/// A program the user calls cannot delegate in the user's name. `check_cpi_return` forwards
+/// every account with its signer flag, as a malicious program would, so the wallet's signature
+/// reaches the host and only the top-level rule stops the grant.
+#[test]
+fn a_wallet_grant_forwarded_through_another_program_is_rejected() {
+    let actors = actors();
+    let grant = grant_ix(
+        actors.payer,
+        actors.delegator,
+        actors.record_key,
+        actors.delegate,
+        actors.app,
+        EXPIRES_AT,
+    );
+    let mut forwarded = zama_solana_test_kit::anchor_ix(
+        vault::id(),
+        vault::accounts::CheckCpiReturn { callee: host::id() },
+        vault::instruction::CheckCpiReturn {
+            instruction_data: grant.data,
+            expected: Vec::new(),
+        },
+    );
+    forwarded.accounts.extend(grant.accounts);
+    let mut accounts = grant_accounts(&actors, empty_system_account(), false);
+    accounts.push((host::id(), host_program_account()));
+
+    mollusk_with_vault().process_and_validate_instruction(
+        &forwarded,
+        &accounts,
+        &[custom_error(
+            host::errors::ZamaHostError::WalletDelegationThroughCpi,
+        )],
+    );
+}
+
+/// Nor can it revoke the user's delegation: on EVM a revocation is keyed on `msg.sender`, which
+/// a contract the user calls is not. The forwarded wallet signature reaches the host, and only
+/// the top-level rule stops the revoke.
+#[test]
+fn a_wallet_revoke_forwarded_through_another_program_is_rejected() {
+    let actors = actors();
+    let revoke = revoke_ix(actors.delegator, actors.record_key);
+    let mut forwarded = zama_solana_test_kit::anchor_ix(
+        vault::id(),
+        vault::accounts::CheckCpiReturn { callee: host::id() },
+        vault::instruction::CheckCpiReturn {
+            instruction_data: revoke.data,
+            expected: Vec::new(),
+        },
+    );
+    forwarded.accounts.extend(revoke.accounts);
+    let mut accounts = revoke_accounts(&actors, record_account(&live_record(&actors)), false);
+    accounts.push((host::id(), host_program_account()));
+
+    mollusk_with_vault().process_and_validate_instruction(
+        &forwarded,
+        &accounts,
+        &[custom_error(
+            host::errors::ZamaHostError::WalletRevokeThroughCpi,
+        )],
+    );
+}
+
+/// An executor cannot act through somebody else's vault: the wrapper holds the vault account
+/// to the seeds of *its own* executor, so the substitution dies before any CPI.
+#[test]
+fn an_executor_cannot_use_another_executors_vault() {
+    let actors = vault_actors();
+    let stranger = Pubkey::new_unique();
+    let (strangers_vault, _) = vault::vault_address(stranger);
+    let mut accounts = vault_accounts(&actors, empty_system_account());
+    accounts[1].0 = strangers_vault;
+    let mut instruction = grant_via_vault_ix(&actors, EXPIRES_AT);
+    instruction.accounts[1] = AccountMeta::new_readonly(strangers_vault, false);
+
+    mollusk_with_vault().process_and_validate_instruction(
+        &instruction,
+        &accounts,
+        &[anchor_framework_error_check(
+            anchor_lang::error::ErrorCode::ConstraintSeeds,
+        )],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SDK cross-pins
+// ---------------------------------------------------------------------------
+// The TS SDK derives these addresses and builds these instruction bytes without this crate. The
+// literals below are the same ones asserted in
+// `sdk/js-sdk/src/solana/actions/userDecryptionDelegation.test.ts` and
+// `sdk/js-sdk/src/solana/actions/revokePermits.test.ts`, so a drift in either side's codec or
+// derivation breaks both suites on the same bytes rather than surfacing on a live cluster.
+
+fn fixture_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[test]
+fn sdk_fixture_delegation_address_and_instruction_bytes() {
+    let delegator = Pubkey::new_from_array([0x11; 32]);
+    let delegate = Pubkey::new_from_array([0x22; 32]);
+    let app = AppScope {
+        program: Pubkey::new_from_array([0x33; 32]),
+        scope: Pubkey::new_from_array([0x44; 32]),
+    };
+
+    let (address, _) = host::user_decryption_delegation_address(delegator, delegate, app);
+    assert_eq!(
+        address.to_string(),
+        "GkmqVNMzqxopBjPkSkZvuLuDE6Jze3iA3Mq5ZHr6SrtJ"
+    );
+
+    let grant = host::instruction::DelegateForUserDecryption {
+        delegate,
+        program: app.program,
+        expires_at: 500,
+    }
+    .data();
+    assert_eq!(
+        fixture_hex(&grant),
+        "f0f8d7586df401672222222222222222222222222222222222222222222222222222222222222222\
+         3333333333333333333333333333333333333333333333333333333333333333f401000000000000"
+    );
+
+    let revoke = host::instruction::RevokeDelegationForUserDecryption {}.data();
+    assert_eq!(fixture_hex(&revoke), "931b7e35412576e1");
+
+    // The record as the program serializes it, for the SDK's hand-rolled account decoder. The
+    // bump is the canonical one of the address above — the only value the program ever stores,
+    // and the SDK's fetch now validates it against its own derivation.
+    let (_, canonical_bump) = host::user_decryption_delegation_address(delegator, delegate, app);
+    assert_eq!(canonical_bump, 255);
+    let record = serialized(UserDecryptionDelegation {
+        delegator,
+        delegate,
+        program: app.program,
+        scope: app.scope,
+        expires_at: 500,
+        delegation_counter: 7,
+        last_update_slot: 400,
+        bump: canonical_bump,
+    });
+    assert_eq!(
+        fixture_hex(&record),
+        "25058b21493501f81111111111111111111111111111111111111111111111111111111111111111\
+         2222222222222222222222222222222222222222222222222222222222222222\
+         3333333333333333333333333333333333333333333333333333333333333333\
+         4444444444444444444444444444444444444444444444444444444444444444\
+         f40100000000000007000000000000009001000000000000ff"
+    );
+}
+
+/// The off-chain readers decode the Clock through the shared crate's own ids and layout; this pins
+/// both against the runtime's, so a wrong offset cannot hide behind fixtures built the same way.
+#[test]
+fn the_shared_clock_decoder_reads_the_runtimes_clock() {
+    assert_eq!(
+        zama_solana_acl::CLOCK_SYSVAR_ID,
+        solana_sdk::sysvar::clock::ID.to_bytes()
+    );
+    assert_eq!(
+        zama_solana_acl::SYSVAR_OWNER_ID,
+        solana_sdk::sysvar::ID.to_bytes()
+    );
+    let clock = solana_sdk::clock::Clock {
+        slot: 1,
+        epoch_start_timestamp: 2,
+        epoch: 3,
+        leader_schedule_epoch: 4,
+        unix_timestamp: 1_700_000_005,
+    };
+    let data = bincode::serialize(&clock).expect("the Clock serializes");
+    assert_eq!(
+        zama_solana_acl::decode_clock_unix_timestamp(&zama_solana_acl::SYSVAR_OWNER_ID, &data),
+        Ok(1_700_000_005)
+    );
+}
+
+/// The relayer's advisory pre-check derives the same addresses from raw seeds
+/// (`relayer/src/host/solana_user_decrypt_precheck.rs`), where these literals are asserted against
+/// the same inputs — a seed-order drift on either side breaks both suites on the same bytes.
+#[test]
+fn relayer_fixture_wildcard_row_and_encrypted_store_addresses() {
+    let delegator = Pubkey::new_from_array([0x11; 32]);
+    let delegate = Pubkey::new_from_array([0x22; 32]);
+    let (wildcard_row, _) =
+        host::user_decryption_delegation_address(delegator, delegate, AppScope::WILDCARD);
+    assert_eq!(
+        wildcard_row.to_string(),
+        "J4BMamYLJvJroFATJp48L6AeQJDQqv86YAQyPqvBcKq1"
+    );
+
+    let (value_address, _) = host::encrypted_store_address(
+        Pubkey::new_from_array([0x33; 32]),
+        delegator,
+        Pubkey::new_from_array([0x55; 32]),
+    );
+    assert_eq!(
+        value_address.to_string(),
+        "5Z8RtcTxGQdTxEZVbyF9T8CF7mMbCFTn8xwhdJ4knso8"
+    );
+}
+
+#[test]
+fn sdk_fixture_permit_invalidation_address_and_revoke_permits_bytes() {
+    let user = Pubkey::new_from_array([0x44; 32]);
+
+    let (address, _) = host::permit_invalidation_address(user);
+    assert_eq!(
+        address.to_string(),
+        "37au5bsVuGt2JKKPQLE8hAdkcXf2LjfnmRKBvxt5Yzep"
+    );
+
+    let revoke_permits = host::instruction::RevokePermits {}.data();
+    assert_eq!(fixture_hex(&revoke_permits), "3319597d7d5ac882");
+}
+
+// ---------------------------------------------------------------------------
+// Cost snapshot
+// ---------------------------------------------------------------------------
+
+/// A first grant by a wallet delegator: the curve check, the record PDA derivation and its
+/// creation. Fixed keys, because the PDA bump search is part of the measured cost.
+#[test]
+fn cost_snapshot_delegate_for_user_decryption() {
+    let delegator = Keypair::new_from_array([0x41; 32]).pubkey();
+    let delegate = Keypair::new_from_array([0x43; 32]).pubkey();
+    let app = AppScope {
+        program: Pubkey::new_from_array([0x44; 32]),
+        scope: Pubkey::new_from_array([0x45; 32]),
+    };
+    let (record_key, record_bump) =
+        host::user_decryption_delegation_address(delegator, delegate, app);
+    let actors = Actors {
+        payer: Pubkey::new_from_array([0x42; 32]),
+        delegator,
+        delegate,
+        app,
+        record_key,
+        record_bump,
+    };
+    let ix = grant_ix(
+        actors.payer,
+        actors.delegator,
+        actors.record_key,
+        actors.delegate,
+        actors.app,
+        EXPIRES_AT,
+    );
+
+    let result = mollusk().process_and_validate_instruction(
+        &ix,
+        &grant_accounts(&actors, empty_system_account(), false),
+        &[Check::success()],
+    );
+    cost_snapshot::assert_cost_snapshot(
+        "user_decryption_delegation_mollusk",
+        "delegate_for_user_decryption/first_grant",
+        &ix,
+        &result,
+    );
+}

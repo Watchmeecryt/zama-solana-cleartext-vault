@@ -1,0 +1,272 @@
+//! Anchor program for the Solana FHEVM host PoC.
+//!
+//! `zama-host` owns the protocol-facing parts of the PoC: the append-only
+//! `EncryptedStore` ACL/MMR model, handle derivation, fhe_execute, public-decrypt
+//! state and the small set of account witnesses that a future
+//! Gateway/KMS request must verify.
+//!
+//! The program intentionally keeps app semantics outside this crate. App
+//! programs, such as `confidential-token`, decide which encrypted store authorities,
+//! scopes and labels they authorize and which keys each write allows, then call this program by
+//! CPI to create or verify host-owned ACL state.
+
+// Anchor macros generate framework-shaped code that trips rustc/Clippy checks.
+#![allow(unexpected_cfgs)]
+#![allow(clippy::diverging_sub_expression, clippy::too_many_arguments)]
+
+/// Plaintexts kept in host accounts by the cleartext simulator build (feature `cleartext`).
+#[cfg(feature = "cleartext")]
+pub mod cleartext;
+/// Shared constants, seed bytes, and fixed protocol sizes.
+pub mod constants;
+/// Off-chain decoding of instruction data and event self-CPIs (feature `decode`).
+#[cfg(feature = "decode")]
+pub mod decode;
+/// EIP-712 v4 verification of EVM-signed KMS / coprocessor certificates.
+pub mod eip712;
+#[cfg(feature = "encode")]
+pub mod encode;
+/// Program-specific errors returned by ZamaHost instructions.
+pub mod errors;
+/// The one event-CPI emitter; every event this program emits goes through it.
+pub(crate) mod event_cpi;
+/// Emitted protocol events (admin and config lifecycle plus the compute event).
+pub mod events;
+/// Instruction account contexts and handlers.
+pub mod instructions;
+/// Decoded op records reconstructed off-chain from instruction data; never emitted.
+pub mod records;
+/// Account layouts, PDA helpers, and handle derivation helpers.
+pub mod state;
+
+use anchor_lang::prelude::*;
+
+/// Re-export constants for generated clients and tests.
+pub use constants::*;
+/// Re-export error types for generated clients and tests.
+pub use errors::*;
+/// Re-export event types for generated clients, listeners, and tests.
+pub use events::*;
+/// Re-export decoded op records for off-chain decoders.
+pub use records::*;
+/// Re-export account layouts and helper functions used by app programs.
+pub use state::*;
+
+use instructions::*;
+
+// Written by build.rs from solana/environments/<PROGRAM_ENVIRONMENT>.json (DD-053).
+include!(concat!(env!("OUT_DIR"), "/program_id.rs"));
+
+/// Anchor entrypoint module generated into the ZamaHost IDL.
+#[program]
+pub mod zama_host {
+    use super::*;
+
+    pub fn open_transient_store<'info>(
+        ctx: Context<'info, OpenTransientStore<'info>>,
+    ) -> Result<()> {
+        instructions::open_transient_store(ctx)
+    }
+
+    pub fn close_transient_store(ctx: Context<CloseTransientStore>) -> Result<()> {
+        instructions::close_transient_store(ctx)
+    }
+
+    pub fn create_encrypted_store(
+        ctx: Context<CreateEncryptedStore>,
+        program: Pubkey,
+        authority_seeds: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        instructions::create_encrypted_store(ctx, program, authority_seeds)
+    }
+
+    pub fn initialize_host_config(
+        ctx: Context<InitializeHostConfig>,
+        args: InitializeHostConfigArgs,
+    ) -> Result<()> {
+        instructions::initialize_host_config(ctx, args)
+    }
+
+    /// Defines a new KMS context (mirror of `ProtocolConfig.mirrorKmsContextAndEpoch`).
+    pub fn define_kms_context(
+        ctx: Context<DefineKmsContext>,
+        context_id: [u8; 32],
+        epoch_id: [u8; 32],
+        signers: Vec<[u8; 20]>,
+        thresholds: KmsThresholds,
+    ) -> Result<()> {
+        instructions::define_kms_context(ctx, context_id, epoch_id, signers, thresholds)
+    }
+
+    /// Activates a new epoch of the active KMS context (mirror of `ProtocolConfig.mirrorKmsEpoch`).
+    pub fn define_kms_epoch(
+        ctx: Context<DefineKmsEpoch>,
+        context_id: [u8; 32],
+        epoch_id: [u8; 32],
+    ) -> Result<()> {
+        instructions::define_kms_epoch(ctx, context_id, epoch_id)
+    }
+
+    /// Destroys a non-current KMS context (mirror of `ProtocolConfig.destroyKmsContext`).
+    pub fn destroy_kms_context(
+        ctx: Context<DestroyKmsContext>,
+        context_id: [u8; 32],
+    ) -> Result<()> {
+        instructions::destroy_kms_context(ctx, context_id)
+    }
+
+    /// Preview-only wipe: closes the program-owned remaining accounts, rent to the upgrade authority.
+    #[cfg(feature = "admin-sweep")]
+    pub fn close_owned_accounts<'info>(
+        ctx: Context<'info, CloseOwnedAccounts<'info>>,
+    ) -> Result<()> {
+        instructions::close_owned_accounts(ctx)
+    }
+
+    /// Stops the host areas `areas` names (any enabled pauser).
+    pub fn pause(ctx: Context<Pause>, areas: PauseFlags) -> Result<()> {
+        instructions::pause(ctx, areas)
+    }
+
+    /// Resumes the host areas `areas` names (admin-only).
+    pub fn unpause(ctx: Context<HostAdmin>, areas: PauseFlags) -> Result<()> {
+        instructions::unpause(ctx, areas)
+    }
+
+    /// Grants or withdraws a key's right to pause (admin-only).
+    pub fn set_pauser(ctx: Context<SetPauser>, pauser: Pubkey, enabled: bool) -> Result<()> {
+        instructions::set_pauser(ctx, pauser, enabled)
+    }
+
+    pub fn set_grant_deny_list_enabled(ctx: Context<HostAdmin>, enabled: bool) -> Result<()> {
+        instructions::set_grant_deny_list_enabled(ctx, enabled)
+    }
+
+    /// Transfers the host admin. Current admin signs; a new keypair co-signs; a new PDA does not.
+    pub fn set_admin(ctx: Context<SetAdmin>, new_admin: Pubkey) -> Result<()> {
+        instructions::set_admin(ctx, new_admin)
+    }
+
+    /// Writes the gateway EIP-712 domain fields together. Zeros are legal.
+    pub fn set_eip712_domain(
+        ctx: Context<HostAdmin>,
+        gateway_chain_id: u64,
+        input_verification_contract: [u8; 20],
+        decryption_contract: [u8; 20],
+    ) -> Result<()> {
+        instructions::set_eip712_domain(
+            ctx,
+            gateway_chain_id,
+            input_verification_contract,
+            decryption_contract,
+        )
+    }
+
+    /// Replaces the registered coprocessor signer set + threshold for input attestations
+    /// (EVM `InputVerifier` parity).
+    pub fn set_coprocessor_signers(
+        ctx: Context<HostAdmin>,
+        signers: Vec<[u8; 20]>,
+        threshold: u8,
+    ) -> Result<()> {
+        instructions::set_coprocessor_signers(ctx, signers, threshold)
+    }
+
+    pub fn set_max_hcu_per_tx(ctx: Context<HostAdmin>, value: u64) -> Result<()> {
+        instructions::set_max_hcu_per_tx(ctx, value)
+    }
+
+    pub fn set_max_hcu_depth_per_tx(ctx: Context<HostAdmin>, value: u64) -> Result<()> {
+        instructions::set_max_hcu_depth_per_tx(ctx, value)
+    }
+
+    /// Sets the per-app, per-slot HCU block cap enforced in `fhe_execute`.
+    pub fn set_hcu_block_cap_per_app(ctx: Context<HostAdmin>, value: u64) -> Result<()> {
+        instructions::set_hcu_block_cap_per_app(ctx, value)
+    }
+
+    /// Registers or clears an application's block-cap bypass in the HCU trust registry
+    /// (admin-only). The application is a `(program, scope)`.
+    pub fn set_hcu_app_trusted(
+        ctx: Context<SetHcuAppTrusted>,
+        app_program: Pubkey,
+        scope: Pubkey,
+        trusted: bool,
+    ) -> Result<()> {
+        instructions::set_hcu_app_trusted(ctx, app_program, scope, trusted)
+    }
+
+    /// Denies or re-admits an application `(program, scope)`: a denied application can neither
+    /// compute nor allow (admin-only).
+    pub fn set_deny_scope(
+        ctx: Context<SetDenyScope>,
+        app_program: Pubkey,
+        scope: Pubkey,
+        denied: bool,
+    ) -> Result<()> {
+        instructions::set_deny_scope(ctx, app_program, scope, denied)
+    }
+
+    pub fn delegate_for_user_decryption(
+        ctx: Context<DelegateForUserDecryption>,
+        delegate: Pubkey,
+        program: Pubkey,
+        expires_at: u64,
+    ) -> Result<()> {
+        instructions::delegate_for_user_decryption(ctx, delegate, program, expires_at)
+    }
+
+    pub fn revoke_delegation_for_user_decryption(
+        ctx: Context<RevokeDelegationForUserDecryption>,
+    ) -> Result<()> {
+        instructions::revoke_delegation_for_user_decryption(ctx)
+    }
+
+    /// Revokes every outstanding permit the signer has issued, by raising their
+    /// invalidation watermark to the current clock.
+    pub fn revoke_permits(ctx: Context<RevokePermits>) -> Result<()> {
+        instructions::revoke_permits(ctx)
+    }
+
+    pub fn fhe_execute<'info>(
+        ctx: Context<'info, FheExecute<'info>>,
+        args: FheExecuteArgs,
+    ) -> Result<()> {
+        instructions::fhe_execute(ctx, args)
+    }
+
+    // ---- EncryptedStore ACL model ----
+
+    /// Seals the value's current handle as publicly decryptable. Every other allow happens
+    /// inline on the `fhe_execute` write that produces the handle.
+    pub fn make_store_handle_public(
+        ctx: Context<MakeStoreHandlePublic>,
+        key: [u8; 32],
+        handle: [u8; 32],
+        previous_leaf_count: u64,
+    ) -> Result<()> {
+        instructions::make_store_handle_public(ctx, key, handle, previous_leaf_count)
+    }
+
+    /// Stateless pull-oracle verifier (fhevm-internal#1704, #1765): verifies a KMS public-decrypt
+    /// certificate against the live `KmsContext` the certificate itself names and returns
+    /// `(handle, cleartext, context_id)` via `return_data`. Creates and mutates nothing; emits
+    /// nothing.
+    pub fn verify_public_decrypt(
+        ctx: Context<VerifyPublicDecrypt>,
+        handle: [u8; 32],
+        cleartext: [u8; 32],
+        signatures: Vec<[u8; 65]>,
+        extra_data: Vec<u8>,
+    ) -> Result<()> {
+        instructions::verify_public_decrypt(ctx, handle, cleartext, signatures, extra_data)
+    }
+}
+
+#[cfg(test)]
+mod pda_vectors {
+    include!("../../../test-fixtures/pda/pda_vectors.rs");
+}
+
+#[cfg(test)]
+mod pda_golden;

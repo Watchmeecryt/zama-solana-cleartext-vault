@@ -1,0 +1,25 @@
+{
+  "name": "@zama-demo/kit",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./vault": "./src/vault.ts",
+    "./config": "./src/config.ts"
+  },
+  "dependencies": {
+    "@fhevm/confidential-token": "*",
+    "@fhevm/sdk": "*",
+    "@fhevm/solana-zama-host": "*",
+    "@scure/base": "^1.2.6",
+    "@solana-program/system": "0.15.0",
+    "@solana-program/token": "0.17.0",
+    "@solana/kit": "8.4.0",
+    "@solana/kit-plugin-instruction-plan": "0.19.0",
+    "@solana/kit-plugin-rpc": "0.19.0",
+    "@solana/kit-plugin-signer": "0.19.0",
+    "@solana/program-client-core": "8.4.0",
+    "@solana/sysvars": "8.4.0"
+  }
+}

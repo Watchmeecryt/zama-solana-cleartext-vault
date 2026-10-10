@@ -1,0 +1,13 @@
+.git
+node_modules
+apps/web/dist
+apps/web/node_modules
+apps/api/node_modules
+packages/demo/node_modules
+.data
+data
+*.log
+.fhevm
+ledger
+target
+.DS_Store

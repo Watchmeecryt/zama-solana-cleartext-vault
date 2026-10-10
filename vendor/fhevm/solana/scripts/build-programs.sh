@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Compile selected programs with the same pinned toolchain in CI, Docker and local tests.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+environment="${1:?usage: build-programs.sh ENVIRONMENT PROGRAM...}"
+shift
+[[ "$#" -gt 0 ]] || { echo 'select at least one program' >&2; exit 1; }
+environment_file="environments/$environment.json"
+[[ -f "$environment_file" ]] || { echo "unknown environment: $environment (no $environment_file)" >&2; exit 1; }
+anchor_version=$(sed -n 's/^anchor_version = "\([^"]*\)"/\1/p' Anchor.toml)
+solana_version=$(sed -n 's/^solana_version = "\([^"]*\)"/\1/p' Anchor.toml)
+[[ "$(anchor --version)" == "anchor-cli $anchor_version" ]] || { echo "Anchor $anchor_version required" >&2; exit 1; }
+# AVM can change the active Solana installation while resolving Anchor.
+[[ "$(solana --version)" == "solana-cli $solana_version "* ]] || { echo "Solana $solana_version required" >&2; exit 1; }
+for program in "$@"; do
+  case "$program" in
+    # The specimens carry their own fixed test ids; they compile the same under every environment.
+    zama_host|confidential_token|demo_vault|confidential_batcher|encrypted_counter|dep_chain) ;;
+    # The local simulator build of zama_host (src/cleartext), written beside the production one.
+    zama_host_cleartext) ;;
+    *) echo "unknown program: $program" >&2; exit 1;;
+  esac
+done
+# `cleartext` makes zama_host record plaintexts in its accounts; it is a local test build only.
+if python3 -c 'import json, sys; sys.exit(not any("cleartext" in f for f in json.load(open(sys.argv[1])).get("features", {}).values()))' "$environment_file"; then
+  echo "$environment_file enables the cleartext test build, which must never be deployed" >&2
+  exit 1
+fi
+bash scripts/install-sbf-tools.sh
+# build.rs reads the program ids from the environment file; each program's cargo features come from
+# the same file (`features.<program>`). The environment is passed as cargo config, not a shell
+# variable: .cargo/config.toml pins PROGRAM_ENVIRONMENT to preview-env so a stray export cannot leak
+# into other builds, and this command-line value overrides that pin for this build only.
+# `anchor build -- <cargo-build-sbf args> -- <cargo args>`.
+cargo_config=(--config "env.PROGRAM_ENVIRONMENT.value=\"$environment\"" --config 'env.PROGRAM_ENVIRONMENT.force=true')
+for program in "$@"; do
+  # The cleartext build is zama_host plus `cleartext` and no environment features, since no
+  # environment deploys it. It is built in its own directory so it never replaces zama_host.so.
+  if [[ "$program" == zama_host_cleartext ]]; then
+    output_dir=$(mktemp -d)
+    anchor build --ignore-keys --no-idl -p zama_host -- --sbf-out-dir "$output_dir" --features cleartext -- "${cargo_config[@]}"
+    mkdir -p target/deploy
+    mv "$output_dir/zama_host.so" target/deploy/zama_host_cleartext.so
+    rm -r "$output_dir"
+    continue
+  fi
+  features=$(python3 -c 'import json, sys; print(",".join(json.load(open(sys.argv[1])).get("features", {}).get(sys.argv[2], [])))' "$environment_file" "$program")
+  args=(build --ignore-keys --no-idl -p "$program" --)
+  if [[ -n "$features" ]]; then args+=(--features "$features"); fi
+  args+=(-- "${cargo_config[@]}")
+  anchor "${args[@]}"
+done

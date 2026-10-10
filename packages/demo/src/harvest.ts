@@ -1,0 +1,37 @@
+import { type Address, type TransactionSigner } from '@solana/kit';
+import { buildHarvestInstruction, getVaultMetrics } from './vault.js';
+import { createFinalizedRpc } from '@fhevm/solana-zama-host';
+import type { DemoConfig } from './config.js';
+import { createDemoClient } from '../../../vendor/fhevm/solana/demo-dapp/src/demoClient.js';
+import type { VaultMetrics } from './batchTypes.js';
+import { DEMO_YEAR_GROWTH_DENOMINATOR, DEMO_YEAR_GROWTH_NUMERATOR } from './yieldPolicy.js';
+
+export const donationForOneYear = (metrics: VaultMetrics): bigint => {
+  if (metrics.totalShares === 0n) throw new Error('the vault has no shares to accrue yield to');
+  const targetAssets =
+    (metrics.totalAssets * DEMO_YEAR_GROWTH_NUMERATOR + DEMO_YEAR_GROWTH_DENOMINATOR - 1n) /
+    DEMO_YEAR_GROWTH_DENOMINATOR;
+  return targetAssets - metrics.totalAssets;
+};
+
+export const readDemoVaultMetrics = async (config: DemoConfig): Promise<VaultMetrics> => {
+  const metrics = await getVaultMetrics(createFinalizedRpc(config.rpcUrl), config.vault);
+  return { totalAssets: metrics.totalAssets, totalShares: metrics.totalShares };
+};
+
+export type UnderlyingMinter = (recipient: Address, baseUnits: bigint) => Promise<string>;
+
+export const harvestDemoVault = async (
+  config: DemoConfig,
+  keeper: TransactionSigner,
+  mintUnderlying: UnderlyingMinter,
+): Promise<{ readonly before: VaultMetrics; readonly after: VaultMetrics }> => {
+  const rpc = createFinalizedRpc(config.rpcUrl);
+  const before = await readDemoVaultMetrics(config);
+  const donation = donationForOneYear(before);
+  await mintUnderlying(keeper.address, donation);
+  await createDemoClient(config, keeper).sendTransaction([
+    await buildHarvestInstruction(rpc, { donor: keeper, vault: config.vault, amount: donation }),
+  ]);
+  return { before, after: await readDemoVaultMetrics(config) };
+};

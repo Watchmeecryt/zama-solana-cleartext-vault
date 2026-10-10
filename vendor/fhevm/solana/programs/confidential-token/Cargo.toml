@@ -1,0 +1,31 @@
+[package]
+name = "confidential-token"
+version = "0.1.0"
+description = "Solana PoC confidential token using the Zama host program"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "confidential_token"
+
+[features]
+default = []
+admin-sweep = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "zama-host/idl-build"]
+
+[build-dependencies]
+program-environment = { path = "../../crates/program-environment" }
+
+[dependencies]
+anchor-lang = { version = "1.2.0", features = ["init-if-needed"] }
+anchor-spl = { version = "1.2.0", default-features = false, features = ["associated_token", "token", "token_2022"] }
+zama-fhe = { path = "../../crates/zama-fhe", features = ["cpi"] }
+zama-host = { path = "../zama-host", features = ["cpi"] }
+
+[dev-dependencies]
+serde_json = "1"

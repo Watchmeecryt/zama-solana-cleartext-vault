@@ -1,0 +1,41 @@
+[package]
+name = "zama-solana-acl"
+version = "0.1.0"
+description = "Shared encrypted-value ACL layout, MMR history, and authorization for the Zama Solana port"
+# Standalone (no workspace inheritance): this crate is consumed as a `path`
+# dependency by the relayer and kms-connector Docker builds, whose contexts do
+# not include the solana workspace root — so it must resolve without it.
+authors = ["Zama"]
+edition = "2021"
+license = "BSD-3-Clause-Clear"
+
+[lib]
+name = "zama_solana_acl"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
+
+[dependencies]
+# Solana-version-agnostic on-chain; off-chain PDA finders use solana-address 2.x.
+# Software hashes are byte-identical to the on-chain syscall hashers.
+borsh = { version = "1", features = ["derive"] }
+
+[target.'cfg(not(target_os = "solana"))'.dependencies]
+solana-address = { version = "2", default-features = false, features = ["curve25519", "sha2"] }
+# sha256: Anchor account discriminators. keccak256: leaf commitments and MMR
+# nodes, shared with the EVM ACL (RFC 034).
+sha2 = { version = "0.10", default-features = false }
+sha3 = { version = "0.10", default-features = false }
+
+# On SBF, hash via the syscalls (~100 CU) instead of software hashing
+# (thousands of CU per hash — enough to blow the per-tx budget on a transfer).
+[target.'cfg(target_os = "solana")'.dependencies]
+solana-sha256-hasher = { version = "3.1.0", default-features = false }
+solana-keccak-hasher = { version = "3.1.0", default-features = false }
+
+[dev-dependencies]
+bs58 = "0.5.1"
+# Leaf vector runner: reads and regenerates the shared normative records.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"

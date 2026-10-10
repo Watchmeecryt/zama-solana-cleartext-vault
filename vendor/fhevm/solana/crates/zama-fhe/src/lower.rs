@@ -1,0 +1,286 @@
+//! Lowers builder operands/outputs to the interned wire format.
+//!
+//! Intern tables are [`TalliedVec`]s that grow through a [`HeapBudget`]. Exact-size
+//! allocations (attestation embeds, allow index lists) go through [`HeapBudget::admit`] and
+//! [`TalliedVec::try_with_capacity`]. Purpose lists are a stack array and never touch the heap.
+//! On drop, an uncommitted step rolls back interned tables in place so a failed step leaves
+//! the builder as it found them.
+
+use zama_host::{CoprocessorInputAttestation, FheExecuteEffect, FheExecuteOperand};
+
+use crate::accounts::{ExecutionAccountMeta, ExecutionAccountPurpose};
+use crate::heap_tally::{HeapBudget, TalliedVec};
+use crate::operand::{Operand, OperandKind};
+use crate::{FheExecutionError, Result};
+
+/// What one in-place account widening changed, small enough to record without allocating. The
+/// record is only complete because the widening in [`StepTables::account_index`] does exactly
+/// two things — OR the flags and append purposes — so anything added there has to be added to
+/// the demote arm of [`StepTables::rollback`] in the same edit.
+#[derive(Debug)]
+struct MetaPromotion {
+    was_writable: bool,
+    was_signer: bool,
+    purposes_len: usize,
+}
+
+/// The builder's intern tables for the duration of one step, borrowed in place, plus the undo log
+/// that lets a step that fails half-way leave them exactly as it found them.
+///
+/// Lowering only ever appends to the two tables, with one exception: an account that is already
+/// interned is widened in place. So an undo is the recorded lengths plus one small record per
+/// promotion — no table is copied, which is what keeps an execution built on-chain inside the
+/// SBF entrypoint's fixed 32 KB bump heap.
+pub(crate) struct StepTables<'b> {
+    remaining_accounts: &'b mut TalliedVec<ExecutionAccountMeta>,
+    dictionary: &'b mut TalliedVec<[u8; 32]>,
+    budget: &'b mut HeapBudget,
+    remaining_accounts_len: usize,
+    dictionary_len: usize,
+    promotions: TalliedVec<(usize, MetaPromotion)>,
+    committed: bool,
+}
+
+impl Drop for StepTables<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.rollback();
+        }
+    }
+}
+
+impl<'b> StepTables<'b> {
+    pub(crate) fn open(
+        remaining_accounts: &'b mut TalliedVec<ExecutionAccountMeta>,
+        dictionary: &'b mut TalliedVec<[u8; 32]>,
+        budget: &'b mut HeapBudget,
+    ) -> Self {
+        Self {
+            remaining_accounts_len: remaining_accounts.len(),
+            dictionary_len: dictionary.len(),
+            remaining_accounts,
+            dictionary,
+            budget,
+            promotions: TalliedVec::new(),
+            committed: false,
+        }
+    }
+
+    pub(crate) fn budget(&mut self) -> &mut HeapBudget {
+        self.budget
+    }
+
+    /// Marks the step as kept. Drop then leaves interned tables as they are.
+    pub(crate) fn commit(&mut self) {
+        self.committed = true;
+    }
+
+    /// Undoes everything this step wrote: promotions newest-first, so an entry promoted twice ends
+    /// on the oldest record, then the appended tails. Requested bytes stay requested.
+    fn rollback(&mut self) {
+        for index in (0..self.promotions.len()).rev() {
+            let (meta_index, undo) = &self.promotions[index];
+            let meta = self
+                .remaining_accounts
+                .get_mut(*meta_index)
+                .expect("promotion records index an interned account");
+            meta.is_writable = undo.was_writable;
+            meta.is_signer = undo.was_signer;
+            meta.purposes.truncate(undo.purposes_len);
+        }
+        self.promotions.truncate(0);
+        self.remaining_accounts
+            .truncate(self.remaining_accounts_len);
+        self.dictionary.truncate(self.dictionary_len);
+    }
+
+    pub(crate) fn account_index(&mut self, required: ExecutionAccountMeta) -> Result<u8> {
+        if let Some(index) = self
+            .remaining_accounts
+            .iter()
+            .position(|candidate| candidate.pubkey == required.pubkey)
+        {
+            let meta = self
+                .remaining_accounts
+                .get_mut(index)
+                .expect("position returned a valid index");
+            let undo = MetaPromotion {
+                was_writable: meta.is_writable,
+                was_signer: meta.is_signer,
+                purposes_len: meta.purposes.len(),
+            };
+            meta.is_writable |= required.is_writable;
+            meta.is_signer |= required.is_signer;
+            for purpose in required.purposes {
+                meta.purposes.try_insert(purpose);
+            }
+            // A lookup that changed nothing needs no undo record: a reduction reading one
+            // value sixty times would otherwise grow the promotion log sixty entries deep.
+            let promoted = meta.is_writable != undo.was_writable
+                || meta.is_signer != undo.was_signer
+                || meta.purposes.len() != undo.purposes_len;
+            if promoted {
+                self.promotions.try_push(self.budget, (index, undo))?;
+            }
+            return u8::try_from(index).map_err(|_| FheExecutionError::TooManyRemainingAccounts);
+        }
+        let index = u8::try_from(self.remaining_accounts.len())
+            .map_err(|_| FheExecutionError::TooManyRemainingAccounts)?;
+        self.remaining_accounts.try_push(self.budget, required)?;
+        Ok(index)
+    }
+
+    /// Interns a 32-byte constant into the execution dictionary, reusing an existing entry
+    /// byte-for-byte.
+    pub(crate) fn dictionary_index(&mut self, bytes: [u8; 32]) -> Result<u8> {
+        if let Some(index) = self.dictionary.iter().position(|entry| *entry == bytes) {
+            return u8::try_from(index).map_err(|_| FheExecutionError::TooManyDictionaryEntries);
+        }
+        let index = u8::try_from(self.dictionary.len())
+            .map_err(|_| FheExecutionError::TooManyDictionaryEntries)?;
+        self.dictionary.try_push(self.budget, bytes)?;
+        Ok(index)
+    }
+
+    /// The signer slot for a Store authority: none when it is the execution's fixed
+    /// CPI signer, otherwise a readonly signing remaining account.
+    fn store_authority_index(
+        &mut self,
+        authority: anchor_lang::prelude::Pubkey,
+        execution_authority: anchor_lang::prelude::Pubkey,
+    ) -> Result<Option<u8>> {
+        if authority == execution_authority {
+            return Ok(None);
+        }
+        self.account_index(ExecutionAccountMeta::readonly_signer(
+            authority,
+            ExecutionAccountPurpose::StoreAuthority,
+        ))
+        .map(Some)
+    }
+}
+
+pub(crate) fn lower_operand(
+    tables: &mut StepTables<'_>,
+    execution_authority: anchor_lang::prelude::Pubkey,
+    produced_count: usize,
+    verified_inputs: &[CoprocessorInputAttestation],
+    operand: Operand,
+) -> Result<FheExecuteOperand> {
+    match operand.0 {
+        OperandKind::StoreSlot { store, key, handle } => {
+            let store_index = tables.account_index(ExecutionAccountMeta::readonly(
+                store.address,
+                ExecutionAccountPurpose::StoreInput,
+            ))?;
+            let key_index = tables.dictionary_index(key)?;
+            tables.store_authority_index(store.authority, execution_authority)?;
+            Ok(FheExecuteOperand::StoreSlot {
+                store_index,
+                key_index,
+                handle_index: tables.dictionary_index(handle)?,
+            })
+        }
+        OperandKind::Granted { consumer, handle } => {
+            let consumer_store_index = tables.account_index(ExecutionAccountMeta::readonly(
+                consumer.address,
+                ExecutionAccountPurpose::StoreInput,
+            ))?;
+            tables.store_authority_index(consumer.authority, execution_authority)?;
+            Ok(FheExecuteOperand::TransientResult {
+                consumer_store_index,
+                handle_index: tables.dictionary_index(handle)?,
+            })
+        }
+
+        OperandKind::Transient { producer_index } => {
+            if producer_index as usize >= produced_count {
+                return Err(FheExecutionError::InvalidTransientReference);
+            }
+            Ok(FheExecuteOperand::EarlierStep { producer_index })
+        }
+        OperandKind::VerifiedInput {
+            attestation_index, ..
+        } => {
+            let attestation = verified_inputs
+                .get(attestation_index as usize)
+                .ok_or(FheExecutionError::MissingVerifiedInput)?;
+            // Admit from the borrowed tables, then clone. On the never-freeing bump a rejected
+            // embed must not have already spent those bytes.
+            tables.budget.admit(
+                std::mem::size_of::<CoprocessorInputAttestation>()
+                    + attestation.ct_handles.len() * std::mem::size_of::<[u8; 32]>()
+                    + attestation.extra_data.len()
+                    + attestation.signatures.len() * std::mem::size_of::<[u8; 65]>(),
+            )?;
+            Ok(FheExecuteOperand::VerifiedInput {
+                attestation: Box::new(attestation.clone()),
+            })
+        }
+        OperandKind::Scalar(value) => Ok(FheExecuteOperand::Scalar {
+            value_index: tables.dictionary_index(value)?,
+        }),
+    }
+}
+
+pub(crate) fn lower_effect(
+    tables: &mut StepTables<'_>,
+    execution_authority: anchor_lang::prelude::Pubkey,
+    result: zama_host::ExecutionResultRef,
+    output: crate::StoreOutput,
+) -> Result<FheExecuteEffect> {
+    crate::validate::validate_allow_keys(&output.allows)?;
+    if output.grants.len() > zama_host::MAX_TRANSIENT_GRANTS {
+        return Err(FheExecutionError::TooManyResultGrants);
+    }
+    let store_index = tables.account_index(
+        if output.slot.is_some() || !output.allows.is_empty() || output.make_public {
+            ExecutionAccountMeta::writable(
+                output.store.address,
+                ExecutionAccountPurpose::StoreOutput,
+            )
+        } else {
+            ExecutionAccountMeta::readonly(
+                output.store.address,
+                ExecutionAccountPurpose::StoreOutput,
+            )
+        },
+    )?;
+    tables.store_authority_index(output.store.authority, execution_authority)?;
+    let slot = output
+        .slot
+        .map(|(key, previous)| -> Result<_> {
+            Ok(zama_host::SlotWrite {
+                key_index: tables.dictionary_index(key)?,
+                previous_handle_index: previous.map(|h| tables.dictionary_index(h)).transpose()?,
+            })
+        })
+        .transpose()?;
+    let mut allows = TalliedVec::try_with_capacity(tables.budget(), output.allows.len())?;
+    for subject in output.allows {
+        let index = tables.dictionary_index(subject.to_bytes())?;
+        allows.try_push(tables.budget(), index)?;
+    }
+    let mut grants = TalliedVec::try_with_capacity(tables.budget(), output.grants.len())?;
+    for consumer in output.grants {
+        let consumer_store_index = tables.account_index(ExecutionAccountMeta::readonly(
+            consumer.address,
+            ExecutionAccountPurpose::StoreInput,
+        ))?;
+        grants.try_push(
+            tables.budget(),
+            zama_host::ResultGrant {
+                consumer_store_index,
+            },
+        )?;
+    }
+    Ok(FheExecuteEffect {
+        result,
+        store_index,
+        previous_leaf_count: output.previous_leaf_count,
+        slot,
+        allow_indexes: allows.into_inner(),
+        make_public: output.make_public,
+        grants: grants.into_inner(),
+    })
+}

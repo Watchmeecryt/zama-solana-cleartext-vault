@@ -1,0 +1,68 @@
+//! CPI wrapper around the host `verify_public_decrypt` instruction.
+
+use anchor_lang::{prelude::*, solana_program::program::get_return_data};
+use zama_host::{cpi, program::ZamaHost, HostConfig};
+
+use crate::ConfidentialTokenError;
+
+/// Inputs required to consume the stateless host public-decrypt verifier.
+pub struct VerifyPublicDecrypt<'a, 'info> {
+    /// Handle the caller pinned; the handle the certificate covers must equal this.
+    pub expected_handle: [u8; 32],
+    /// 32-byte big-endian `uint256` cleartext the KMS certificate signs over.
+    pub cleartext: [u8; 32],
+    /// KMS threshold signatures over the `PublicDecryptVerification` certificate.
+    pub signatures: Vec<[u8; 65]>,
+    /// Signed `extra_data` committing the KMS context id (EVM `_extractContextId` parity).
+    pub extra_data: Vec<u8>,
+    /// Host config carrying the current KMS context id and gateway EIP-712 domain.
+    pub host_config: &'a Account<'info, HostConfig>,
+    /// KMS context PDA for the id the certificate commits to (any live context).
+    pub kms_context: AccountInfo<'info>,
+    /// ZamaHost program account.
+    pub zama_program: &'a Program<'info, ZamaHost>,
+}
+
+/// CPIs the stateless host `verify_public_decrypt`, then reads the `(handle, cleartext, context_id)`
+/// it wrote to `return_data`, asserting the return came from ZamaHost and that the certified handle
+/// equals the caller-pinned `expected_handle`. Returns the certified 32-byte cleartext. The host
+/// verifies the KMS certificate against the context the cert names (any live, non-destroyed
+/// context); this wrapper adds only the return-data integrity + pinned-handle checks. It
+/// deliberately does NOT constrain the returned context id: token disclosure and redemption accept
+/// any live context, matching EVM's valid-until-destroyed rotation
+/// grace (`destroy_kms_context` is the revocation lever). The verified id is the `context_id`
+/// field of [`zama_host::instructions::PublicDecryptReturnData`] for a consumer that wants a
+/// current-only policy.
+pub(crate) fn verify_public_decrypt(request: VerifyPublicDecrypt<'_, '_>) -> Result<[u8; 32]> {
+    let expected_handle = request.expected_handle;
+    cpi::verify_public_decrypt(
+        CpiContext::new(
+            request.zama_program.key(),
+            cpi::accounts::VerifyPublicDecrypt {
+                host_config: request.host_config.to_account_info(),
+                kms_context: request.kms_context,
+            },
+        ),
+        expected_handle,
+        request.cleartext,
+        request.signatures,
+        request.extra_data,
+    )?;
+
+    let (program_id, data) =
+        get_return_data().ok_or(ConfidentialTokenError::VerifierReturnDataInvalid)?;
+    require_keys_eq!(
+        program_id,
+        zama_host::ID,
+        ConfidentialTokenError::VerifierReturnDataInvalid
+    );
+    let returned = zama_host::instructions::PublicDecryptReturnData::try_from_slice(&data)
+        .map_err(|_| ConfidentialTokenError::VerifierReturnDataInvalid)?;
+    require!(
+        returned.handle == expected_handle,
+        ConfidentialTokenError::DisclosedHandleMismatch
+    );
+    // `returned.context_id` is the verified context id; token disclosure and redemption accept
+    // any live context (EVM parity), so it is not constrained here.
+    Ok(returned.cleartext)
+}

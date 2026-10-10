@@ -1,0 +1,265 @@
+//! Opens the next batch: the `Batch` account, its per-batch authority, its own
+//! confidential token accounts (join and payout side), and its plain SPL
+//! accounts for settle's redeem/vault/wrap phases.
+//!
+//! One batch, one token account: the burned/revealed total is exactly this
+//! batch's sum, so dust from an earlier batch can never leak into it (the EVM
+//! batcher documents the inter-batch dust leak this prevents).
+//!
+//! Direction-free: the join/payout roles are fixed by the batcher config, so
+//! deposit and redeem batches open identically.
+
+use super::*;
+
+/// Accounts for opening a batch.
+#[derive(Accounts)]
+#[instruction(index: u64)]
+pub struct OpenBatch<'info> {
+    /// Pays batch-account rent and the batch authority funding.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// Batcher config; `next_batch_index` advances.
+    #[account(mut)]
+    pub batcher: Box<Account<'info, Batcher>>,
+    /// The immediately preceding batch; required except for the first open.
+    /// A new batch may not open while it is still pending.
+    pub previous_batch: Option<Box<Account<'info, Batch>>>,
+    /// The batch, at the batcher's next index.
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + Batch::INIT_SPACE,
+        seeds = [BATCH_SEED, batcher.key().as_ref(), &index.to_le_bytes()],
+        bump,
+    )]
+    pub batch: Box<Account<'info, Batch>>,
+    /// CHECK: per-batch authority PDA; owns every batch token account, signs
+    /// the batch's fhe_execute CPIs and token CPIs, and pays owner-charged rent from
+    /// the funding it receives here.
+    #[account(mut, seeds = [BATCH_AUTHORITY_SEED, batch.key().as_ref()], bump)]
+    pub batch_authority: UncheckedAccount<'info>,
+    /// Confidential mint users join batches with.
+    pub join_confidential_mint: Box<Account<'info, ct::ConfidentialMint>>,
+    /// CHECK: batch's confidential join token account; created by the token CPI, or kept as is if
+    /// someone already created it.
+    #[account(mut)]
+    pub batch_join_token_account: UncheckedAccount<'info>,
+    /// CHECK: batch join balance encrypted store; created by the host CPI.
+    #[account(mut)]
+    pub batch_join_balance_store: UncheckedAccount<'info>,
+    /// Confidential mint claims pay out in.
+    pub payout_confidential_mint: Box<Account<'info, ct::ConfidentialMint>>,
+    /// CHECK: batch's confidential payout token account; created by the token CPI, or kept as is if
+    /// someone already created it.
+    #[account(mut)]
+    pub batch_payout_token_account: UncheckedAccount<'info>,
+    /// CHECK: batch payout balance encrypted store; created by the host CPI.
+    #[account(mut)]
+    pub batch_payout_balance_store: UncheckedAccount<'info>,
+    /// SPL mint the join confidential mint wraps (vault underlying for deposit
+    /// batchers, vault shares for redeem batchers).
+    pub join_underlying_mint: Box<Account<'info, SplMint>>,
+    /// SPL mint the payout confidential mint wraps (vault shares for deposit
+    /// batchers, vault underlying for redeem batchers).
+    pub payout_underlying_mint: Box<Account<'info, SplMint>>,
+    /// Batch's plain SPL account receiving the redeemed batch total at settle.
+    #[account(
+        init,
+        payer = payer,
+        seeds = [BATCH_JOIN_UNDERLYING_SEED, batch.key().as_ref()],
+        bump,
+        token::mint = join_underlying_mint,
+        token::authority = batch_authority,
+    )]
+    pub batch_join_underlying: Box<Account<'info, TokenAccount>>,
+    /// Batch's plain SPL account receiving the vault phase's output at settle.
+    #[account(
+        init,
+        payer = payer,
+        seeds = [BATCH_PAYOUT_UNDERLYING_SEED, batch.key().as_ref()],
+        bump,
+        token::mint = payout_underlying_mint,
+        token::authority = batch_authority,
+    )]
+    pub batch_payout_underlying: Box<Account<'info, TokenAccount>>,
+    /// CHECK: Anchor event CPI authority for the Zama host program.
+    #[account(seeds = [b"__event_authority"], bump = zama_host::EVENT_AUTHORITY_AND_BUMP.1, seeds::program = zama_host::ID)]
+    pub zama_event_authority: UncheckedAccount<'info>,
+    /// CHECK: shared transaction transient store, validated by ZamaHost.
+    #[account(mut)]
+    pub transient_store: UncheckedAccount<'info>,
+    /// CHECK: runtime Instructions sysvar, validated by ZamaHost.
+    pub instructions: UncheckedAccount<'info>,
+    /// ZamaHost program (FHE compute + ACL).
+    pub zama_program: Program<'info, ZamaHost>,
+    #[account(seeds = [zama_host::HOST_CONFIG_SEED], bump = host_config.bump, seeds::program = zama_host::ID)]
+    pub host_config: Box<Account<'info, zama_host::HostConfig>>,
+    /// CHECK: confidential-token event-CPI authority; validated by the token program.
+    pub confidential_token_event_authority: UncheckedAccount<'info>,
+    /// confidential-token program composed via CPI.
+    pub confidential_token_program: Program<'info, ConfidentialToken>,
+    /// SPL token program.
+    pub token_program: Program<'info, Token>,
+    /// System program used for account creation.
+    pub system_program: Program<'info, System>,
+    /// The join mint's HCU block meter for the token CPI. Supplied while the block cap binds and the
+    /// application is not trusted.
+    /// CHECK: validated by ZamaHost.
+    #[account(mut)]
+    pub join_mint_hcu_block_meter: Option<UncheckedAccount<'info>>,
+    /// The join mint's HCU trust record for the token CPI. Supplied while the block cap binds and the
+    /// application is trusted.
+    /// CHECK: validated by ZamaHost.
+    pub join_mint_hcu_trusted_app_record: Option<UncheckedAccount<'info>>,
+    /// The payout mint's HCU block meter for the token CPI. Supplied while the block cap binds and the
+    /// application is not trusted.
+    /// CHECK: validated by ZamaHost.
+    #[account(mut)]
+    pub payout_mint_hcu_block_meter: Option<UncheckedAccount<'info>>,
+    /// The payout mint's HCU trust record for the token CPI. Supplied while the block cap binds and the
+    /// application is trusted.
+    /// CHECK: validated by ZamaHost.
+    pub payout_mint_hcu_trusted_app_record: Option<UncheckedAccount<'info>>,
+}
+
+/// Creates the batch and, unless they already exist, both of its confidential token accounts.
+pub fn open_batch<'info>(
+    ctx: Context<'info, OpenBatch<'info>>,
+    index: u64,
+    authority_funding_lamports: u64,
+) -> Result<()> {
+    require_eq!(
+        index,
+        ctx.accounts.batcher.next_batch_index,
+        BatcherError::BatchIndexMismatch
+    );
+    require_keys_eq!(
+        ctx.accounts.join_confidential_mint.key(),
+        ctx.accounts.batcher.join_confidential_mint,
+        BatcherError::ConfidentialMintMismatch
+    );
+    require_keys_eq!(
+        ctx.accounts.payout_confidential_mint.key(),
+        ctx.accounts.batcher.payout_confidential_mint,
+        BatcherError::ConfidentialMintMismatch
+    );
+    require_keys_eq!(
+        ctx.accounts.join_underlying_mint.key(),
+        ctx.accounts.join_confidential_mint.underlying_mint,
+        BatcherError::JoinMintVaultMismatch
+    );
+    require_keys_eq!(
+        ctx.accounts.payout_underlying_mint.key(),
+        ctx.accounts.payout_confidential_mint.underlying_mint,
+        BatcherError::PayoutMintVaultMismatch
+    );
+    match (&ctx.accounts.previous_batch, index) {
+        (None, 0) => {}
+        (None, _) => return Err(BatcherError::PreviousBatchMismatch.into()),
+        (Some(previous), _) => {
+            require!(index > 0, BatcherError::PreviousBatchMismatch);
+            require_keys_eq!(
+                previous.key(),
+                batch_address(ctx.accounts.batcher.key(), index - 1).0,
+                BatcherError::PreviousBatchMismatch
+            );
+            require!(
+                previous.status != BatchStatus::Pending,
+                BatcherError::PreviousBatchStillPending
+            );
+        }
+    }
+
+    fund_batch_authority(
+        &ctx.accounts.payer,
+        &ctx.accounts.batch_authority,
+        &ctx.accounts.system_program,
+        authority_funding_lamports,
+    )?;
+
+    let batch_key = ctx.accounts.batch.key();
+    let authority = BatchAuthoritySeeds::new(batch_key, ctx.bumps.batch_authority);
+    let authority_seeds = authority.seeds();
+    let [join_deny_records, payout_deny_records] =
+        split_deny_records(&ctx.accounts.host_config, ctx.remaining_accounts, [1, 1])?;
+    for (mint, token_account, balance_store, records, hcu_block_meter, hcu_trusted_app_record) in [
+        (
+            &ctx.accounts.join_confidential_mint,
+            &ctx.accounts.batch_join_token_account,
+            &ctx.accounts.batch_join_balance_store,
+            join_deny_records,
+            &ctx.accounts.join_mint_hcu_block_meter,
+            &ctx.accounts.join_mint_hcu_trusted_app_record,
+        ),
+        (
+            &ctx.accounts.payout_confidential_mint,
+            &ctx.accounts.batch_payout_token_account,
+            &ctx.accounts.batch_payout_balance_store,
+            payout_deny_records,
+            &ctx.accounts.payout_mint_hcu_block_meter,
+            &ctx.accounts.payout_mint_hcu_trusted_app_record,
+        ),
+    ] {
+        ct::cpi::initialize_token_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.confidential_token_program.key(),
+                ct::cpi::accounts::InitializeTokenAccount {
+                    payer: ctx.accounts.batch_authority.to_account_info(),
+                    owner: ctx.accounts.batch_authority.to_account_info(),
+                    mint: mint.to_account_info(),
+                    token_account: token_account.to_account_info(),
+                    balance_encrypted_store: balance_store.to_account_info(),
+                    zama_event_authority: ctx.accounts.zama_event_authority.to_account_info(),
+                    transient_store: ctx.accounts.transient_store.to_account_info(),
+                    instructions: ctx.accounts.instructions.to_account_info(),
+                    zama_program: ctx.accounts.zama_program.to_account_info(),
+                    host_config: ctx.accounts.host_config.to_account_info(),
+                    system_program: ctx.accounts.system_program.to_account_info(),
+                    hcu_block_meter: hcu_block_meter
+                        .as_ref()
+                        .map(|account| account.to_account_info()),
+                    hcu_trusted_app_record: hcu_trusted_app_record
+                        .as_ref()
+                        .map(|account| account.to_account_info()),
+                    event_authority: ctx
+                        .accounts
+                        .confidential_token_event_authority
+                        .to_account_info(),
+                    program: ctx.accounts.confidential_token_program.to_account_info(),
+                },
+                &[&authority_seeds],
+            )
+            .with_remaining_accounts(records.to_vec()),
+        )?;
+    }
+
+    let opened_at = Clock::get()?.unix_timestamp;
+    let batch = &mut ctx.accounts.batch;
+    batch.batcher = ctx.accounts.batcher.key();
+    batch.index = index;
+    batch.status = BatchStatus::Pending;
+    batch.opened_at = opened_at;
+    batch.dispatched_at = 0;
+    batch.join_count = 0;
+    batch.authority_bump = ctx.bumps.batch_authority;
+    batch.bump = ctx.bumps.batch;
+    batch.burned_total_handle = [0; 32];
+    batch.total_joined = 0;
+    batch.payout_received = 0;
+    batch.payout_rate = 0;
+
+    let batcher = &mut ctx.accounts.batcher;
+    batcher.next_batch_index = index
+        .checked_add(1)
+        .ok_or(BatcherError::BatchIndexOverflow)?;
+
+    emit!(BatchOpened {
+        version: APP_EVENT_VERSION,
+        batcher: batcher.key(),
+        batch: batch_key,
+        index,
+        batch_authority: ctx.accounts.batch_authority.key(),
+        opened_at,
+    });
+    Ok(())
+}

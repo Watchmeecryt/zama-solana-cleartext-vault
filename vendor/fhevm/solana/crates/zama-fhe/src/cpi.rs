@@ -1,0 +1,147 @@
+//! CPI assembly: turns an `FheExecution` plus resolved accounts into the host call.
+
+#[cfg(feature = "cpi")]
+use anchor_lang::{
+    prelude::AccountInfo,
+    solana_program::{
+        instruction::{AccountMeta, Instruction},
+        program::invoke_signed,
+    },
+    Key, ToAccountInfos, ToAccountMetas,
+};
+
+#[cfg(feature = "cpi")]
+use crate::accounts::ResolvedExecutionAccounts;
+#[cfg(feature = "cpi")]
+use crate::execution::FheExecution;
+#[cfg(feature = "cpi")]
+use crate::FheExecutionError;
+
+/// The fixed accounts of one `fhe_execute` CPI. The per-execution ones — the application's deny
+/// record and the host's rand nonce — are derived from the built execution: `FheExecution::app`
+/// names the `(program, scope)` the deny record is keyed on, `FheExecution::has_rand_step` says
+/// whether the nonce is needed.
+#[cfg(feature = "cpi")]
+pub struct ExecutionCpiAccounts<'info> {
+    pub payer: AccountInfo<'info>,
+    pub authority: AccountInfo<'info>,
+    pub host_config: AccountInfo<'info>,
+    /// One `DenyScopeRecord` per application the execution touches (the caller's, plus that of
+    /// every value written or read under an additional signing authority), required while the
+    /// host's deny list is enabled and refused while it is disabled.
+    pub deny_scope_records: Vec<AccountInfo<'info>>,
+    pub system_program: AccountInfo<'info>,
+    /// Per-application HCU block meter (mut), keyed on the execution's `(program, scope)`.
+    /// Untrusted applications in the metering band supply it; trusted applications and the
+    /// unrestricted default pass `None`.
+    pub hcu_block_meter: Option<AccountInfo<'info>>,
+    /// HCU trust witness (read-only), keyed on the execution's `(program, scope)`. `Some` + valid
+    /// ⇒ bypass; `None` ⇒ untrusted (metered).
+    pub hcu_trusted_app_record: Option<AccountInfo<'info>>,
+    /// The host's rand nonce (mut), required exactly when the execution has a rand step.
+    pub rand_nonce: Option<AccountInfo<'info>>,
+    pub transient_store: AccountInfo<'info>,
+    pub instructions: AccountInfo<'info>,
+    pub event_authority: AccountInfo<'info>,
+    /// Must be `zama_host::ID`, which is compiled from the `PROGRAM_ENVIRONMENT` the app is built
+    /// with, so an app build targets exactly one Zama deployment; a build outside this workspace
+    /// gets `preview-env` unless it sets the variable (DD-053). Any other account fails with
+    /// [`FheExecutionError::HostProgramMismatch`], logging the received and expected ids.
+    pub program: AccountInfo<'info>,
+}
+
+/// Invokes `zama-host::fhe_execute` with accounts pre-resolved from a [`FheExecution`].
+/// App-facing surface: [`FheExecution::invoke`].
+#[cfg(feature = "cpi")]
+pub(crate) fn invoke_execution_signed<'info>(
+    execution: &mut FheExecution,
+    accounts: ExecutionCpiAccounts<'info>,
+    resolved_accounts: &ResolvedExecutionAccounts<'info>,
+    signer_seeds: &[&[&[u8]]],
+) -> anchor_lang::prelude::Result<()> {
+    if accounts.program.key() != zama_host::ID {
+        return Err(
+            anchor_lang::error::Error::from(FheExecutionError::HostProgramMismatch)
+                .with_pubkeys((accounts.program.key(), zama_host::ID)),
+        );
+    }
+    if accounts.authority.key() != execution.authority() {
+        return Err(
+            anchor_lang::error::Error::from(FheExecutionError::ExecutionAuthorityMismatch)
+                .with_pubkeys((accounts.authority.key(), execution.authority())),
+        );
+    }
+    let deny_scope_records = accounts.deny_scope_records;
+    let fixed_accounts = zama_host::cpi::accounts::FheExecute {
+        payer: accounts.payer,
+        authority: accounts.authority,
+        host_config: accounts.host_config,
+        system_program: accounts.system_program,
+        hcu_block_meter: accounts.hcu_block_meter,
+        hcu_trusted_app_record: accounts.hcu_trusted_app_record,
+        rand_nonce: accounts.rand_nonce,
+        transient_store: accounts.transient_store,
+        instructions: accounts.instructions,
+        event_authority: accounts.event_authority,
+        program: accounts.program,
+    };
+    let (account_metas, account_infos) = fhe_execute_account_tables(
+        &fixed_accounts,
+        execution,
+        resolved_accounts,
+        &deny_scope_records,
+    )?;
+
+    // The execution self-describes its `remaining_accounts` length (DD-033). The deny-record
+    // witnesses are appended per transaction, so the final count is only known here — stamped in
+    // place: `invoke` consumed the execution, so nothing can observe the mutation.
+    execution.args.account_count =
+        u8::try_from(execution.remaining_accounts.len() + deny_scope_records.len())
+            .map_err(|_| FheExecutionError::TooManyRemainingAccounts)?;
+
+    let instruction = Instruction {
+        program_id: zama_host::ID,
+        accounts: account_metas,
+        data: crate::execution::fhe_execute_instruction_data(&execution.args),
+    };
+
+    invoke_signed(&instruction, &account_infos, signer_seeds)?;
+    Ok(())
+}
+
+/// Assembles the `fhe_execute` CPI account tables exactly as
+/// [`crate::heap_tally::invoke_table_heap_bytes`] charges them at `build()`: Anchor's generated
+/// accessors grow the fixed accounts from empty, then one exact reservation sizes the dynamic
+/// tail — no doubling on the never-freeing bump heap past the fixed accounts. The heap-budget
+/// invoke measurement runs this function under a counting allocator, so the model and this
+/// assembly cannot drift apart silently.
+#[cfg(feature = "cpi")]
+pub(crate) fn fhe_execute_account_tables<'info>(
+    fixed_accounts: &zama_host::cpi::accounts::FheExecute<'info>,
+    execution: &FheExecution,
+    resolved_accounts: &ResolvedExecutionAccounts<'info>,
+    deny_scope_records: &[AccountInfo<'info>],
+) -> anchor_lang::prelude::Result<(Vec<AccountMeta>, Vec<AccountInfo<'info>>)> {
+    let mut account_metas = fixed_accounts.to_account_metas(None);
+    let mut account_infos = fixed_accounts.to_account_infos();
+    let dynamic_tail = execution.remaining_accounts.len() + deny_scope_records.len();
+    account_metas.reserve_exact(dynamic_tail);
+    account_infos.reserve_exact(dynamic_tail);
+    for required in &execution.remaining_accounts {
+        let account = resolved_accounts
+            .resolve(required.pubkey)
+            .ok_or(FheExecutionError::MissingDynamicAccount)?;
+        let meta = if required.is_writable {
+            AccountMeta::new(required.pubkey, required.is_signer)
+        } else {
+            AccountMeta::new_readonly(required.pubkey, required.is_signer)
+        };
+        account_metas.push(meta);
+        account_infos.push(account);
+    }
+    for record in deny_scope_records {
+        account_metas.push(AccountMeta::new_readonly(record.key(), false));
+        account_infos.push(record.clone());
+    }
+    Ok((account_metas, account_infos))
+}

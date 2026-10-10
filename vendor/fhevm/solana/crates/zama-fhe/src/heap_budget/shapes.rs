@@ -1,0 +1,289 @@
+//! Specimen constructors for the app-side frontier.
+
+use anchor_lang::prelude::Pubkey;
+
+use zama_host::{CoprocessorInputAttestation, MAX_FHE_EXECUTION_STEPS};
+
+use crate::builder::FheExecutionBuilder;
+use crate::{AppScope, Encrypted, FheExecution, Scalar, Store, StoreOutput, Uint, Uint64Handle};
+
+use super::harness::balance_handle;
+
+/// The widest allow list the frontier explores per output: eight keys, the cap the retired
+/// per-account list had, kept so the boundary numbers stay comparable across the redesign.
+pub(crate) const WIDE_ALLOW_LIST: usize = 8;
+
+fn fresh_app() -> AppScope {
+    AppScope {
+        program: Pubkey::new_unique(),
+        scope: Pubkey::new_unique(),
+    }
+}
+
+pub(crate) fn shape_state(handle: [u8; 32]) -> zama_host::EncryptedStore {
+    let app = fresh_app();
+    zama_host::EncryptedStore {
+        program: app.program,
+        authority: Pubkey::new_unique(),
+        scope: app.scope,
+        slots: vec![zama_host::EncryptedSlot {
+            key: [0; 32],
+            handle,
+        }],
+        leaf_count: 0,
+        peaks: vec![],
+        bump: 0,
+    }
+}
+
+/// `count` distinct allowed keys with `tag` in their first byte.
+fn allow_keys(tag: u8, count: usize) -> impl Iterator<Item = Pubkey> {
+    (0..count).map(move |key| {
+        let mut bytes = [0u8; 32];
+        bytes[0] = tag;
+        bytes[1] = key as u8 + 1;
+        bytes[31] = 1;
+        Pubkey::new_from_array(bytes)
+    })
+}
+
+fn allow_all(output: StoreOutput, keys: impl Iterator<Item = Pubkey>) -> StoreOutput {
+    keys.fold(output, StoreOutput::allow)
+}
+
+/// Whether a persist-heavy shape's Store outputs write new slots or replace existing ones.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistKind {
+    Create,
+    Update,
+}
+
+/// Pre-built app data for a persist-heavy shape: the persistent input the chain starts from and
+/// one ready persistent output per persisting step, each allowing `allows_per_output` distinct
+/// keys so every key interns its own dictionary entry — the heaviest audience per output. A
+/// create writes an empty Store slot; update replaces an existing slot.
+pub(crate) fn persist_shape_data(
+    kind: PersistKind,
+    outputs: usize,
+    allows_per_output: usize,
+) -> (Uint64Handle, Vec<StoreOutput>) {
+    let mut account = shape_state(balance_handle(1));
+    if kind == PersistKind::Update {
+        account
+            .slots
+            .extend((0..outputs).map(|index| zama_host::EncryptedSlot {
+                key: [index as u8; 32],
+                handle: balance_handle(0xB0 + index as u8),
+            }));
+    }
+    let store = Store::new(&account);
+    let input = store.get([0; 32]).expect("input handle");
+    let outputs = (0..outputs)
+        .map(|index| {
+            allow_all(
+                store.set([index as u8; 32]),
+                allow_keys(0x40 + index as u8, allows_per_output),
+            )
+        })
+        .collect();
+    (input, outputs)
+}
+
+/// A dependent chain whose first `outputs.len()` steps write Store outputs and whose remaining
+/// steps stay transient. The dep-chain / load-smoke specimen uses one Store output.
+pub(crate) fn chain_with_outputs(
+    steps: usize,
+    input: Uint64Handle,
+    outputs: Vec<StoreOutput>,
+) -> impl for<'id> FnOnce(&mut FheExecutionBuilder<'id>) -> crate::Result<()> {
+    move |builder| {
+        let mut value = Encrypted::from(input);
+        let mut outputs = outputs.into_iter();
+        for _ in 0..steps {
+            value = builder.add(value, Scalar::<Uint<64>>::u64(1))?;
+            if let Some(output) = outputs.next() {
+                builder.output(value, output)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A maximum-size coprocessor attestation: full handle coverage, full extra data, one
+/// signature. The signature bytes are arbitrary — the builder checks only the handle type;
+/// verification happens on the host.
+pub(crate) fn max_size_attestation(tag: u8) -> CoprocessorInputAttestation {
+    let handles: Vec<[u8; 32]> = (0..zama_host::MAX_INPUT_ATTESTATION_HANDLES)
+        .map(|position| {
+            let mut handle = balance_handle(tag);
+            handle[21] = position as u8;
+            handle
+        })
+        .collect();
+    CoprocessorInputAttestation {
+        input_handle: handles[0],
+        ct_handles: handles,
+        handle_index: 0,
+        user_address: [0xAA; 32],
+        contract_address: [0xBB; 32],
+        contract_chain_id: 1,
+        extra_data: vec![0xCC; zama_host::MAX_INPUT_ATTESTATION_EXTRA_DATA],
+        signatures: vec![[0xDD; 65]],
+    }
+}
+
+/// Every step consumes its own maximum-size verified input. The build-heap budget is what caps
+/// this shape — each attestation embeds at over a kilobyte of handles, extra data, and
+/// signature — so the heaviest buildable attestation count is found by asking the builder, not
+/// assumed. The attestations are built before the measurement starts: they are the app's own
+/// data; what the builder pays for is registering them and embedding one copy per consuming
+/// step.
+pub(crate) fn attestation_shape(
+    count: usize,
+) -> impl for<'id> FnOnce(&mut FheExecutionBuilder<'id>) -> crate::Result<()> {
+    let attestations: Vec<CoprocessorInputAttestation> = (0..count)
+        .map(|tag| max_size_attestation(0x90 + tag as u8))
+        .collect();
+    move |builder| {
+        for attestation in attestations {
+            let input = builder.verified_input::<Uint<64>>(attestation)?;
+            builder.add(input, Scalar::<Uint<64>>::u64(1))?;
+        }
+        Ok(())
+    }
+}
+
+/// The largest attestation-per-step execution the builder admits — one past it must be rejected
+/// by a typed ceiling (today the build-heap budget), which the fit test asserts.
+pub(crate) fn max_buildable_attestation_count() -> usize {
+    (1..=MAX_FHE_EXECUTION_STEPS)
+        .take_while(|count| {
+            FheExecution::build(
+                crate::StoreId::new(
+                    anchor_lang::prelude::Pubkey::new_from_array([0xA9; 32]),
+                    Pubkey::new_unique(),
+                    Pubkey::new_from_array([0xA5; 32]),
+                ),
+                attestation_shape(*count),
+            )
+            .is_ok()
+        })
+        .last()
+        .expect("at least one attestation fits")
+}
+
+pub(crate) fn persist_shape(
+    kind: PersistKind,
+    steps: usize,
+    outputs: usize,
+    allows: usize,
+) -> impl for<'id> FnOnce(&mut FheExecutionBuilder<'id>) -> crate::Result<()> {
+    let (input, outputs) = persist_shape_data(kind, outputs, allows);
+    chain_with_outputs(steps, input, outputs)
+}
+
+/// The invariant #61 counterexample shape: `updates` outputs, each to its own Store of one app
+/// holding `peak_count` MMR peaks, all allowing the same eight keys. The shared keys intern
+/// once and the builder never reads a Store's peaks, so it prices this shape like a narrow one,
+/// while the host appends eight leaves per output to each Store's peaks in its own heap.
+pub(crate) fn shared_audience_mature_updates_shape(
+    updates: usize,
+    peak_count: u32,
+) -> impl for<'id> FnOnce(&mut FheExecutionBuilder<'id>) -> crate::Result<()> {
+    let app = fresh_app();
+    let mature_store = |handle: [u8; 32]| zama_host::EncryptedStore {
+        leaf_count: ((1u64 << peak_count) - 1) << 8,
+        peaks: vec![[0xAB; 32]; peak_count as usize],
+        program: app.program,
+        scope: app.scope,
+        ..shape_state(handle)
+    };
+    let input_account = mature_store(balance_handle(1));
+    let input = Store::new(&input_account)
+        .get([0; 32])
+        .expect("input handle");
+    let outputs = (0..updates)
+        .map(|index| {
+            let account = mature_store(balance_handle(0xC0 + index as u8));
+            allow_all(
+                Store::new(&account).set([0; 32]),
+                allow_keys(0x60, WIDE_ALLOW_LIST),
+            )
+        })
+        .collect();
+    chain_with_outputs(updates, input, outputs)
+}
+
+/// Which reduction op a reduction-heavy shape drives — the only caller-sized operand
+/// tables, admitted through `reduction_operands`.
+#[derive(Clone, Copy)]
+pub(crate) enum ReductionKind {
+    Sum,
+    IsIn,
+}
+
+/// `steps` reduction steps of `operands` operands each, chained so each step consumes the
+/// previous one's result. The operand tables are what this shape stresses: reserved from the
+/// size hint and tallied per push.
+pub(crate) fn reduction_shape(
+    kind: ReductionKind,
+    steps: usize,
+    operands: usize,
+) -> impl for<'id> FnOnce(&mut FheExecutionBuilder<'id>) -> crate::Result<()> {
+    let account = shape_state(balance_handle(2));
+    let input: Uint64Handle = Store::new(&account).get([0; 32]).expect("input handle");
+    move |builder| {
+        let mut value = Encrypted::from(input);
+        for _ in 0..steps {
+            match kind {
+                ReductionKind::Sum => {
+                    value = builder.sum((0..operands).map(|_| value))?;
+                }
+                ReductionKind::IsIn => {
+                    builder.is_in(value, (0..operands).map(|_| value))?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A chain that mixes every tallied table in one build: adds, a mid-chain sum and set
+/// membership, and one Store output at the end.
+pub(crate) fn mixed_ops_shape(
+) -> impl for<'id> FnOnce(&mut FheExecutionBuilder<'id>) -> crate::Result<()> {
+    let (input, outputs) = persist_shape_data(PersistKind::Create, 1, 2);
+    move |builder| {
+        let mut value = Encrypted::from(input);
+        for step in 0..(MAX_FHE_EXECUTION_STEPS - 2) {
+            value = if step % 4 == 3 {
+                builder.sum((0..8).map(|_| value))?
+            } else {
+                builder.add(value, Scalar::<Uint<64>>::u64(1))?
+            };
+        }
+        builder.is_in(value, (0..8).map(|_| value))?;
+        let output = outputs.into_iter().next().expect("one create");
+        builder
+            .add(value, Scalar::<Uint<64>>::u64(1))
+            .and_then(|result| {
+                builder.output(result, output)?;
+                Ok(result)
+            })?;
+        Ok(())
+    }
+}
+
+/// One maximum-size attestation consumed once, then reused by reference for the rest of the
+/// chain — the embed is paid once, not per consuming step.
+pub(crate) fn reused_attestation_shape(
+) -> impl for<'id> FnOnce(&mut FheExecutionBuilder<'id>) -> crate::Result<()> {
+    let attestation = max_size_attestation(0x8F);
+    move |builder| {
+        let mut value = builder.verified_input::<Uint<64>>(attestation)?;
+        for _ in 0..(MAX_FHE_EXECUTION_STEPS - 1) {
+            value = builder.add(value, Scalar::<Uint<64>>::u64(1))?;
+        }
+        Ok(())
+    }
+}

@@ -1,0 +1,53 @@
+[package]
+name = "zama-host"
+version = "0.1.0"
+description = "Solana PoC host program for Zama FHEVM ACL and compute events"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "zama_host"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+# Off-chain instruction/event decoding for indexers (host-listener, proof
+# service). Not reachable from the SBF builds we run: `anchor build` and
+# `cargo build-sbf -p zama-host` both resolve `feature="default"` only. A
+# workspace-wide SBF build would feature-unify it in from the off-chain crates
+# that request it -- as it already would `cpi`/`no-entrypoint`, the more
+# serious half, since that would ship a `.so` with no entrypoint.
+decode = []
+# Off-chain fhe_execute encoding for clients and tests (runtime-tests). Same
+# unification caveat as `decode` above.
+encode = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
+# `close_owned_accounts`, the preview-env wipe. Only solana/environments/preview-env.json enables it;
+# runtime-tests requests it, so the unification caveat on `decode` applies here too.
+admin-sweep = []
+# Cleartext simulator build for local tests (src/cleartext): `fhe_execute` also records the
+# plaintext of each result in the accounts it writes. Never listed in an environment file;
+# `scripts/check-zama-host-idl.sh` builds it as `zama_host_cleartext.so`. runtime-tests requests it,
+# so the unification caveat on `decode` applies here too.
+cleartext = []
+
+[build-dependencies]
+program-environment = { path = "../../crates/program-environment" }
+
+[dependencies]
+anchor-lang = { version = "1.2.0", features = ["event-cpi", "init-if-needed"] }
+solana-keccak-hasher = { version = "3.1.0", features = ["sha3"] }
+solana-instructions-sysvar = "3.0.1"
+solana-sysvar = { version = "3.1.1", features = ["bytemuck"] }
+solana-secp256k1-recover = "3.1.1"
+zama-solana-acl = { path = "../../crates/zama-solana-acl" }
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
+
+[dev-dependencies]
+k256 = { version = "0.13.4", features = ["ecdsa"] }
+sha2 = "0.10"
+serde_json = "1"

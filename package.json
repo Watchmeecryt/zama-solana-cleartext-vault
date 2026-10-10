@@ -1,0 +1,22 @@
+{
+  "name": "zama-solana-cleartext-vault",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/web",
+    "apps/api",
+    "packages/demo",
+    "vendor/fhevm/sdk/js-sdk/src",
+    "vendor/fhevm/solana/clients/zama-host",
+    "vendor/fhevm/solana/clients/confidential-token"
+  ],
+  "scripts": {
+    "build:web": "npm run build -w web",
+    "check:web": "npm run check -w web",
+    "start": "npm run start -w api",
+    "reset": "bash scripts/reset.sh"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,224 @@
+import type { ChecksummedAddress, Uint256BigInt, Uint8Number } from '../types/primitives.js';
+import type { kmsBrand } from '../types/kms.js';
+import type { KmsSignersContext } from '../types/kmsSignersContext.js';
+import type { ErrorMetadataParams } from '../base/errors/ErrorBase.js';
+import type { FhevmRuntime } from '../types/coreFhevmRuntime.js';
+import type { KmsExtraData } from '../types/kms-p.js';
+import { InvalidTypeError } from '../base/errors/InvalidTypeError.js';
+import { addressToChecksummedAddress } from '../base/address.js';
+import { DuplicateSignerError, ThresholdSignerError, UnknownSignerError } from '../errors/SignersError.js';
+import { assertOwnedBy } from '../runtime/CoreFhevmRuntime-p.js';
+import { createKmsExtraData, validateKmsExtraDataParams } from '../kms/kmsExtraData-p.js';
+
+////////////////////////////////////////////////////////////////////////////////
+
+const PRIVATE_TOKEN = Symbol('KmsSignersContext.token');
+const VERIFY_FUNC = Symbol('KmsSignersContext.verify');
+
+////////////////////////////////////////////////////////////////////////////////
+// KmsVerifierContractData (private implementation)
+////////////////////////////////////////////////////////////////////////////////
+
+class KmsSignersContextImpl implements KmsSignersContext {
+  declare readonly [kmsBrand]: never;
+
+  readonly #owner: WeakRef<FhevmRuntime>;
+  readonly #kmsVerifierAddress: ChecksummedAddress;
+  readonly #kmsContextId: Uint256BigInt;
+  readonly #kmsEpochId: Uint256BigInt;
+  readonly #kmsSigners: ChecksummedAddress[];
+  readonly #kmsSignersSet: Set<string>;
+  readonly #kmsPublicDecryptThreshold: Uint8Number;
+  readonly #kmsMpcThreshold: Uint8Number | undefined;
+
+  constructor(
+    privateToken: symbol,
+    owner: WeakRef<FhevmRuntime>,
+    parameters: {
+      readonly address: ChecksummedAddress;
+      readonly kmsContextId: Uint256BigInt;
+      readonly kmsEpochId: Uint256BigInt;
+      readonly kmsSigners: ChecksummedAddress[];
+      readonly kmsSignerThreshold: Uint8Number;
+      readonly kmsMpcThreshold?: Uint8Number | undefined;
+    },
+  ) {
+    if (privateToken !== PRIVATE_TOKEN) {
+      throw new Error('Unauthorized');
+    }
+    this.#owner = owner;
+    this.#kmsVerifierAddress = parameters.address;
+    this.#kmsContextId = parameters.kmsContextId;
+    this.#kmsEpochId = parameters.kmsEpochId;
+    this.#kmsSigners = [...parameters.kmsSigners];
+    this.#kmsPublicDecryptThreshold = parameters.kmsSignerThreshold;
+    this.#kmsMpcThreshold = parameters.kmsMpcThreshold;
+    this.#kmsSignersSet = new Set(this.#kmsSigners.map((addr) => addr.toLowerCase()));
+
+    Object.freeze(this.#kmsSigners);
+    Object.freeze(this);
+  }
+
+  public get kmsVerifierAddress(): ChecksummedAddress {
+    return this.#kmsVerifierAddress;
+  }
+
+  public get id(): Uint256BigInt {
+    return this.#kmsContextId;
+  }
+
+  public get epochId(): Uint256BigInt {
+    return this.#kmsEpochId;
+  }
+
+  public get signers(): ChecksummedAddress[] {
+    return this.#kmsSigners;
+  }
+
+  public get threshold(): Uint8Number {
+    return this.#kmsPublicDecryptThreshold;
+  }
+
+  public get mpcThreshold(): Uint8Number | undefined {
+    return this.#kmsMpcThreshold;
+  }
+
+  public has(signer: string): boolean {
+    return this.#kmsSignersSet.has(signer.toLowerCase());
+  }
+
+  public static [VERIFY_FUNC](instance: unknown, owner: FhevmRuntime): void {
+    if (!(instance instanceof KmsSignersContextImpl)) {
+      throw new Error('Invalid KmsSignersContext instance');
+    }
+    assertOwnedBy({
+      actualOwner: instance.#owner,
+      expectedOwner: owner,
+      name: 'KmsSignersContext',
+    });
+  }
+
+  public toJSON(): Record<string, unknown> {
+    return {
+      kmsVerifierAddress: this.#kmsVerifierAddress,
+      id: this.#kmsContextId,
+      epochId: this.#kmsEpochId,
+      signers: this.#kmsSigners,
+      threshold: this.#kmsPublicDecryptThreshold,
+      ...(this.#kmsMpcThreshold ? { mpcThreshold: this.#kmsMpcThreshold } : {}),
+    };
+  }
+}
+
+// Prevent prototype pollution and constructor access
+Object.freeze(KmsSignersContextImpl.prototype);
+Object.freeze(KmsSignersContextImpl);
+
+////////////////////////////////////////////////////////////////////////////////
+
+export function createKmsSignersContext(
+  owner: WeakRef<FhevmRuntime>,
+  parameters: {
+    readonly kmsVerifierAddress: ChecksummedAddress;
+    readonly kmsContextId: Uint256BigInt;
+    readonly kmsEpochId: Uint256BigInt;
+    readonly kmsSigners: readonly ChecksummedAddress[];
+    readonly kmsSignerThreshold: Uint8Number;
+    readonly kmsMpcThreshold?: Uint8Number | undefined;
+  },
+): KmsSignersContext {
+  const {
+    kmsVerifierAddress: address,
+    kmsContextId,
+    kmsEpochId,
+    kmsSigners,
+    kmsSignerThreshold,
+    kmsMpcThreshold,
+  } = parameters;
+
+  validateKmsExtraDataParams({ kmsContextId: parameters.kmsContextId, kmsEpochId: parameters.kmsEpochId });
+
+  return new KmsSignersContextImpl(PRIVATE_TOKEN, owner, {
+    address: addressToChecksummedAddress(address),
+    kmsContextId,
+    kmsEpochId,
+    kmsSignerThreshold: Number(kmsSignerThreshold) as Uint8Number,
+    kmsSigners: kmsSigners.map(addressToChecksummedAddress),
+    kmsMpcThreshold,
+  });
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+export function kmsSignersContextToExtraData(kmsSignersContext: KmsSignersContext): KmsExtraData {
+  assertIsKmsSignersContext(kmsSignersContext, {});
+  return createKmsExtraData({ kmsContextId: kmsSignersContext.id, kmsEpochId: kmsSignersContext.epochId });
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Verifies that the given `KmsSignersContext` instance is owned
+ * by the given runtime. Throws if not.
+ */
+export function assertKmsSignersContextOwnedBy(data: KmsSignersContext, owner: FhevmRuntime): void {
+  KmsSignersContextImpl[VERIFY_FUNC](data, owner);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+export function assertKmsSignerThreshold(
+  kmsSignersContext: KmsSignersContext,
+  recoveredAddresses: readonly string[],
+): void {
+  const type = 'kms';
+  const addressMap = new Set<string>();
+  recoveredAddresses.forEach((address) => {
+    if (addressMap.has(address.toLowerCase())) {
+      throw new DuplicateSignerError({
+        duplicateAddress: address,
+        type,
+      });
+    }
+    addressMap.add(address.toLowerCase());
+  });
+
+  for (const address of recoveredAddresses) {
+    if (!kmsSignersContext.has(address.toLowerCase())) {
+      throw new UnknownSignerError({
+        unknownAddress: address,
+        type,
+      });
+    }
+  }
+
+  if (recoveredAddresses.length < kmsSignersContext.threshold) {
+    throw new ThresholdSignerError({
+      type,
+    });
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+export function isKmsSignersContext(value: unknown): value is KmsSignersContext {
+  return value instanceof KmsSignersContextImpl;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+export function assertIsKmsSignersContext(
+  value: unknown,
+  options: { readonly subject?: string } & ErrorMetadataParams,
+): asserts value is KmsSignersContext {
+  if (!isKmsSignersContext(value)) {
+    throw new InvalidTypeError(
+      {
+        subject: options.subject,
+        type: typeof value,
+        expectedType: 'KmsSignersContext',
+      },
+      options,
+    );
+  }
+}

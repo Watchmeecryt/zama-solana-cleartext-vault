@@ -1,0 +1,47 @@
+import type { Fhevm } from '../../types/coreFhevmClient.js';
+import type { Uint64BigInt } from '../../types/primitives.js';
+import { assertIsUint64, asUint64BigInt } from '../../base/uint.js';
+import { getTrustedClient, initPublicAction } from '../../runtime/CoreFhevm-p.js';
+
+export type ResolveChainIdParameters = {
+  readonly id?: number | bigint | undefined;
+  readonly verify?: boolean;
+};
+
+export type ResolveChainIdReturnType = Uint64BigInt;
+
+export async function resolveChainId(
+  fhevm: Fhevm,
+  parameters: ResolveChainIdParameters,
+): Promise<ResolveChainIdReturnType> {
+  const trustedClient = getTrustedClient(fhevm);
+  const { id, verify } = parameters;
+
+  // No id provided → fetch from chain
+  if (id === undefined) {
+    return asUint64BigInt(await fhevm.runtime.ethereum.getChainId(trustedClient));
+  }
+
+  assertIsUint64(id, {});
+  const resolvedId = BigInt(id) as Uint64BigInt;
+
+  // no context needed
+  await initPublicAction(fhevm);
+
+  // Id provided, no verification requested → return as-is
+  // By default, do not verify
+  if (verify !== true) {
+    return resolvedId;
+  }
+
+  // Id provided + verify → cross-check with chain
+  const chainId = asUint64BigInt(await fhevm.runtime.ethereum.getChainId(trustedClient));
+
+  if (resolvedId !== chainId) {
+    const message = `Chain id mismatch: connected to chain ${chainId}, but expected chain ${resolvedId}`;
+    fhevm.runtime.config.logger?.error?.(message, undefined);
+    throw new Error(message);
+  }
+
+  return resolvedId;
+}

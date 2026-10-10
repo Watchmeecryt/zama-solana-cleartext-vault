@@ -1,0 +1,157 @@
+//! Initializes the singleton ZamaHost configuration account.
+
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::bpf_loader_upgradeable;
+
+use super::common::*;
+use crate::{constants::HCU_UNLIMITED, errors::ZamaHostError, state::*};
+use zama_solana_acl::host_chain::{is_evm_host_chain_id, is_solana_host_chain_id};
+
+/// Accounts for initializing the singleton [`HostConfig`].
+#[derive(Accounts)]
+#[event_cpi]
+pub struct InitializeHostConfig<'info> {
+    /// Pays rent for the config account.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// Initial admin stored in the config. Must be the BPF upgrade authority.
+    pub admin: Signer<'info>,
+    /// Upgradeable loader `ProgramData` for this program; `admin` must be its upgrade authority.
+    /// A finalized program (`upgrade_authority_address == None`) cannot initialize.
+    #[account(
+        address = bpf_loader_upgradeable::get_program_data_address(&crate::ID),
+        constraint = program_data.upgrade_authority_address == Some(admin.key()) @ ZamaHostError::HostConfigAdminMismatch
+    )]
+    pub program_data: Account<'info, ProgramData>,
+    /// Singleton config PDA.
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + HostConfig::SPACE,
+        seeds = [HOST_CONFIG_SEED],
+        bump
+    )]
+    pub host_config: Account<'info, HostConfig>,
+    /// The host's single rand nonce, created alongside the config so every rand execution can
+    /// take it from the first slot on.
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + RandNonce::SPACE,
+        seeds = [RAND_NONCE_SEED],
+        bump
+    )]
+    pub rand_nonce: Account<'info, RandNonce>,
+    /// System program used for account creation.
+    pub system_program: Program<'info, System>,
+}
+
+/// Initializes the singleton host config and the rand nonce.
+pub fn initialize_host_config(
+    ctx: Context<InitializeHostConfig>,
+    args: InitializeHostConfigArgs,
+) -> Result<()> {
+    assert_no_remaining_accounts(ctx.remaining_accounts)?;
+    assert_valid_host_config_args(&args)?;
+    let (coprocessor_signers, coprocessor_signer_count) = validate_and_pack_coprocessor_signers(
+        &args.coprocessor_signers,
+        args.coprocessor_threshold,
+    )?;
+    let config = &mut ctx.accounts.host_config;
+    config.admin = ctx.accounts.admin.key();
+    config.chain_id = args.chain_id;
+    config.gateway_chain_id = args.gateway_chain_id;
+    config.input_verification_contract = args.input_verification_contract;
+    config.coprocessor_signers = coprocessor_signers;
+    config.coprocessor_signer_count = coprocessor_signer_count;
+    config.coprocessor_threshold = args.coprocessor_threshold;
+    config.decryption_contract = args.decryption_contract;
+    config.current_kms_context_id = [0u8; 32];
+    config.current_kms_epoch_id = [0u8; 32];
+    config.paused = PauseFlags::default();
+    config.grant_deny_list_enabled = args.grant_deny_list_enabled;
+    // Unlimited (u64::MAX) until the admin sets them: `bootstrapZamaHost` sets EVM's limits in the
+    // same transaction (INVARIANTS #37).
+    config.max_hcu_per_tx = HCU_UNLIMITED;
+    config.max_hcu_depth_per_tx = HCU_UNLIMITED;
+    // Ship the per-app block cap unrestricted (u64::MAX): the neutral state that short-circuits
+    // the cap and touches no meter. A `0` default would instead ban every untrusted app on deploy.
+    config.hcu_block_cap_per_app = HCU_UNLIMITED;
+    config.bump = ctx.bumps.host_config;
+    ctx.accounts.rand_nonce.nonce = 0;
+    ctx.accounts.rand_nonce.bump = ctx.bumps.rand_nonce;
+    let config = &ctx.accounts.host_config;
+    let admin = config.admin;
+    emit_config_updated(config, admin, &ctx.accounts.event_authority)?;
+    Ok(())
+}
+
+fn assert_valid_host_config_args(args: &InitializeHostConfigArgs) -> Result<()> {
+    require!(
+        is_solana_host_chain_id(args.chain_id) && is_evm_host_chain_id(args.gateway_chain_id),
+        ZamaHostError::InvalidChainTypeByte
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zama_solana_acl::host_chain::solana_host_chain_id;
+
+    fn valid_args() -> InitializeHostConfigArgs {
+        InitializeHostConfigArgs {
+            chain_id: solana_host_chain_id(42),
+            gateway_chain_id: 0,
+            input_verification_contract: [0u8; 20],
+            coprocessor_signers: vec![[0x11u8; 20]],
+            coprocessor_threshold: 1,
+            decryption_contract: [0u8; 20],
+            grant_deny_list_enabled: false,
+        }
+    }
+
+    #[test]
+    fn valid_production_args_pass() {
+        assert!(assert_valid_host_config_args(&valid_args()).is_ok());
+    }
+
+    #[test]
+    fn local_chain_id_is_valid_without_relaxing_entropy() {
+        let mut args = valid_args();
+        args.chain_id = SOLANA_POC_CHAIN_ID;
+        assert!(assert_valid_host_config_args(&args).is_ok());
+    }
+
+    #[test]
+    fn rejects_solana_chain_id_without_type_byte() {
+        let mut args = valid_args();
+        args.chain_id = 12345;
+        let err = assert_valid_host_config_args(&args).unwrap_err();
+        assert_eq!(err, error!(ZamaHostError::InvalidChainTypeByte));
+    }
+
+    #[test]
+    fn rejects_zero_chain_id() {
+        let mut args = valid_args();
+        args.chain_id = 0;
+        let err = assert_valid_host_config_args(&args).unwrap_err();
+        assert_eq!(err, error!(ZamaHostError::InvalidChainTypeByte));
+    }
+
+    #[test]
+    fn rejects_gateway_chain_id_with_solana_type_byte() {
+        let mut args = valid_args();
+        args.gateway_chain_id = solana_host_chain_id(1);
+        let err = assert_valid_host_config_args(&args).unwrap_err();
+        assert_eq!(err, error!(ZamaHostError::InvalidChainTypeByte));
+    }
+
+    #[test]
+    fn rejects_unknown_host_chain_type_byte() {
+        let mut args = valid_args();
+        args.chain_id = 0x0200_0000_0000_3039;
+        let err = assert_valid_host_config_args(&args).unwrap_err();
+        assert_eq!(err, error!(ZamaHostError::InvalidChainTypeByte));
+    }
+}
