@@ -97,6 +97,7 @@ const bringUp = async (keys: AppKeys, reset: boolean): Promise<{ validator: Vali
     await wipeLedger();
     await rm(paths.config, { force: true });
     await rm(paths.seededFlag, { force: true });
+    await rm(paths.genesisStamp, { force: true });
     await clearActivity();
   }
   const validator = await startValidator({ upgradeAuthority: keys.deployer.address, reset: true });

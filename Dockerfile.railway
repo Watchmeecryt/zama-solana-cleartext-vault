@@ -62,7 +62,7 @@ RUN bun build apps/api/src/index.ts --target=bun --outdir=/tmp/api-bundle
 FROM --platform=linux/amd64 oven/bun:1.3.14-debian AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates libssl3 libudev1 \
+      ca-certificates libssl3 libudev1 libstdc++6 libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=sbf /root/.local/share/solana/install/active_release /usr/local/solana
