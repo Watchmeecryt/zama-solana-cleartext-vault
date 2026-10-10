@@ -86,6 +86,10 @@ If `RESET_TOKEN` is set, send `Authorization: Bearer $RESET_TOKEN`. Reset stops 
 
 The container is safe to run as root (Railway’s default). Ledger directory is `/data/ledger` and created with open permissions for volume mounts.
 
+`solana-test-validator` is started with `--log` (no TTY dashboard), `--bind-address 127.0.0.1`, and `--advertised-ip 127.0.0.1` so it does not try to discover a public gossip IP. Its stdout/stderr is prefixed `[validator]` and mirrored to `$DATA_DIR/validator.log`. On exit the API prints the last 100 lines of that file. The runtime image installs `libstdc++6` (Agave’s only extra dynamic lib).
+
+Official Agave **linux/amd64** binaries need **AVX2**. Bun’s “Linux x64 baseline” line is the JS runtime target, not the host CPU. If `solana-test-validator` dies with `SIGILL` and host diagnostics show `avx2 no`, that is a Railway CPU limit we cannot work around. The crash this change targets was `exit 1` in ~100ms (a process that started and called `exit`), not SIGILL or OOM.
+
 Build time is long: the first stage compiles four Solana programs with the pinned toolchain.
 
 ## Environment variables

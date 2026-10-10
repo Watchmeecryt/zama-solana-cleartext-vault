@@ -34,6 +34,7 @@ export const paths = {
   keeper: path.join(env.dataDir, 'keys', 'keeper.json'),
   mintAuthority: path.join(env.dataDir, 'keys', 'mint-authority.json'),
   validatorLog: path.join(env.dataDir, 'validator.log'),
+  genesisStamp: path.join(env.dataDir, 'genesis-stamp.json'),
   seededFlag: path.join(env.dataDir, 'seeded.json'),
 };
 
