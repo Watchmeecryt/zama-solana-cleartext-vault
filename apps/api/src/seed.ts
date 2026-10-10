@@ -21,6 +21,7 @@ import {
   getInitializeBatcherInstruction,
   getInitializeVaultInstructionAsync,
   openBatchForBatcher,
+  parseDemoConfig,
   readHostPolicy,
   ZAMA_HOST_PROGRAM_ADDRESS,
   CONFIDENTIAL_TOKEN_PROGRAM_ADDRESS,
@@ -30,6 +31,11 @@ import {
 import { env, paths } from './env.js';
 import { recordActivity } from './activity.js';
 import { fundAddress } from './bootstrap.js';
+import {
+  CLEARTEXT_STORE_ACCOUNT_SIZE,
+  CONFIDENTIAL_TOKEN_ACCOUNT_SIZE,
+  resolveAuthorityFundingLamports,
+} from './funding.js';
 import type { AppKeys } from './keys.js';
 
 const MOCK_USDC_DECIMALS = 6;
@@ -79,6 +85,21 @@ export const seedDemo = async (rpcUrl: string, wsUrl: string, keys: AppKeys, pub
   if (kmsContextAccount.value === null) {
     throw new Error(`kms-context account ${kmsContext} is missing; host bootstrap did not finish`);
   }
+
+  // batch_authority — not the fee payer — pays both InitializeTokenAccount/CreateEncryptedStore rents.
+  const storeRent = await rpc.getMinimumBalanceForRentExemption(BigInt(CLEARTEXT_STORE_ACCOUNT_SIZE)).send();
+  const tokenAccountRent = await rpc
+    .getMinimumBalanceForRentExemption(BigInt(CONFIDENTIAL_TOKEN_ACCOUNT_SIZE))
+    .send();
+  const authorityFundingLamports = resolveAuthorityFundingLamports(
+    env.authorityFundingLamports,
+    storeRent,
+    tokenAccountRent,
+  );
+  console.log(
+    `open_batch authority funding ${authorityFundingLamports} lamports ` +
+      `(store rent ${storeRent} × 2, token-account rent ${tokenAccountRent} × 2)`,
+  );
 
   const mockUsdcMint = await generateKeyPairSigner();
   const vaultAccount = await generateKeyPairSigner();
@@ -191,7 +212,7 @@ export const seedDemo = async (rpcUrl: string, wsUrl: string, keys: AppKeys, pub
         roots: { ...commonRoots, ...roots },
         batchIndex: 0n,
         payer: keeper,
-        authorityFundingLamports: env.authorityFundingLamports,
+        authorityFundingLamports,
         host: await readHostPolicy(rpc),
       }),
     ]);
@@ -212,7 +233,7 @@ export const seedDemo = async (rpcUrl: string, wsUrl: string, keys: AppKeys, pub
     payoutUnderlyingMint: mockUsdcMint.address,
   });
 
-  const config = {
+  const config = parseDemoConfig({
     source: 'demo-config',
     network: 'localnet',
     demoBootId: `cleartext-${Date.now()}`,
@@ -222,7 +243,7 @@ export const seedDemo = async (rpcUrl: string, wsUrl: string, keys: AppKeys, pub
     relayerUrl: `${publicRpcUrl.replace(/\/rpc$/, '')}/api/relayer`,
     aclProgram: addressToBytes32Hex(ZAMA_HOST_PROGRAM_ADDRESS),
     fheParameter: 'cleartext',
-    authorityFundingLamports: env.authorityFundingLamports.toString(),
+    authorityFundingLamports: authorityFundingLamports.toString(),
     programs: {
       batcher: CONFIDENTIAL_BATCHER_PROGRAM_ADDRESS,
       token: CONFIDENTIAL_TOKEN_PROGRAM_ADDRESS,
@@ -242,7 +263,7 @@ export const seedDemo = async (rpcUrl: string, wsUrl: string, keys: AppKeys, pub
     },
     mintAuthority: mintAuthority.address,
     personas: { keeper: keeper.address, alice: keeper.address },
-  };
+  });
 
   await mkdir(path.dirname(paths.config), { recursive: true });
   await writeFile(paths.config, JSON.stringify(config, null, 2));

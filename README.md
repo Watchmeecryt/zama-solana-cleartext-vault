@@ -37,7 +37,7 @@ One Railway container:
 4. Runs a keeper that opens batches, dispatches after `min_batch_age`, produces public-decrypt certificates via the cleartext client, settles, claims, and after the settle deadline runs `cancel_dispatch` plus permissionless refunds. It also harvests illustrative yield.
 5. Serves the React dApp as static files on the same `$PORT`.
 6. Proxies validator JSON-RPC and WebSocket at `/rpc` and `/rpc-ws` so the page and external wallets can reach the cluster.
-7. Exposes `/health`, a faucet, activity history, and `POST /api/reset`.
+7. Exposes `/health` and `/api/status` (seed + validator), a faucet, activity history, and `POST /api/reset`. Seed failures are logged and retried with backoff; they do not take the HTTP server down.
 
 The validator ledger uses `--limit-ledger-size 1000000` so the leaf-record / MMR path can reconstruct handle history.
 
@@ -47,7 +47,7 @@ The validator ledger uses `--limit-ledger-size 1000000` so the leaf-record / MMR
 
 Compiling the Solana programs in `Dockerfile.railway` takes over an hour on Windows. Pull the prebuilt **linux/amd64** image from GHCR instead.
 
-The package is **private**. Create a GitHub personal access token with the `read:packages` scope, then:
+The repository is public. If the GHCR package is still private, create a GitHub personal access token with the `read:packages` scope, then:
 
 ```powershell
 docker login ghcr.io
@@ -58,7 +58,7 @@ docker compose up
 
 `docker-compose.yml` maps port 8080, mounts a named volume at `/data`, and sets `security_opt: [seccomp:unconfined]`. Docker Desktop’s default seccomp profile blocks **io_uring**, which Agave 4.3 needs.
 
-Open http://127.0.0.1:8080. `/health` should report `ok` after the validator and seed finish (often 30–90 seconds).
+Open http://127.0.0.1:8080. `/health` and `/api/status` stay up while the validator and seed run (often 30–90 seconds). A seed error is reported on those endpoints and retried; it does not exit the container.
 
 Images are published on every push to `main` (and `workflow_dispatch`) as:
 
@@ -128,7 +128,7 @@ Build time is long: the first stage compiles four Solana programs with the pinne
 | `RESET_TOKEN` | unset | If set, required to call `POST /api/reset` |
 | `MIN_BATCH_AGE_SECS` | `10` | Time before a pending batch may dispatch |
 | `SETTLE_DEADLINE_SECS` | `120` | After this, anyone may `cancel_dispatch` |
-| `AUTHORITY_FUNDING_LAMPORTS` | `100000000` | Rent float for each batch authority PDA |
+| `AUTHORITY_FUNDING_LAMPORTS` | `1000000000` | Lamports transferred to each `batch_authority` PDA. That PDA (not the fee payer) pays two cleartext `EncryptedStore` rents (~66.3M each) plus token-account rent. Official batcher tests use 1 SOL. Seed also floors this to `2 × (store + token-account) rent + 50M`. |
 | `KEEPER_INTERVAL_MS` | `4000` | Keeper poll |
 | `HARVEST_INTERVAL_MS` | `180000` | Illustrative 7% harvest cadence |
 | `VALIDATOR_RPC_PORT` | `8899` | Internal validator RPC (not published) |

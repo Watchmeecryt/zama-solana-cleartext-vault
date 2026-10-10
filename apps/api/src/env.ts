@@ -21,7 +21,9 @@ export const env = {
   validatorGossipPort: integer('VALIDATOR_GOSSIP_PORT', 8001),
   minBatchAgeSecs: BigInt(integer('MIN_BATCH_AGE_SECS', 10)),
   settleDeadlineSecs: BigInt(integer('SETTLE_DEADLINE_SECS', 120)),
-  authorityFundingLamports: BigInt(integer('AUTHORITY_FUNDING_LAMPORTS', 100_000_000)),
+  // OpenBatch funds batch_authority with this; that PDA pays two cleartext EncryptedStores.
+  // Official batcher tests use 1 SOL. 0.1 SOL is not enough (second store needs ~66_321_840).
+  authorityFundingLamports: BigInt(integer('AUTHORITY_FUNDING_LAMPORTS', 1_000_000_000)),
   keeperIntervalMs: integer('KEEPER_INTERVAL_MS', 4000),
   harvestIntervalMs: integer('HARVEST_INTERVAL_MS', 180_000),
   chainId: BigInt(process.env.SOLANA_HOST_CHAIN_ID ?? '72057594037940281'),
