@@ -1,0 +1,715 @@
+//! Shared Mollusk test fixtures for programs that build on `zama-host`.
+//!
+//! The kit holds only what is program-agnostic or `zama-host`-generic: the Mollusk environment,
+//! Anchor instruction/account plumbing, the host's fixture accounts (`HostConfig`, `KmsContext`,
+//! `EncryptedStore`, deny records), the coprocessor/KMS signature minting, plaintext reads of the
+//! cleartext host build, the checks of an instruction's `fhe_execute` CPIs, and the rolling cost
+//! snapshots. Program-specific fixtures (a token's mints, a batcher's batches) stay with their
+//! suites.
+//!
+//! The kit deliberately depends on no program crate other than `zama-host`: each suite registers
+//! its own programs on the `Mollusk` it gets from [`svm`], so a new consumer program can use the
+//! kit without pulling in every program in the workspace.
+
+pub mod cleartext;
+pub mod cost_snapshot;
+pub mod executions;
+pub mod signing;
+pub mod transaction;
+
+pub mod contracts;
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use anchor_lang::solana_program::bpf_loader_upgradeable::{self, UpgradeableLoaderState};
+use anchor_lang::{
+    prelude::system_program, AccountDeserialize, AccountSerialize, AnchorDeserialize,
+    Discriminator, InstructionData, ToAccountMetas,
+};
+use anchor_spl::token::spl_token;
+use anchor_spl::token_2022::spl_token_2022;
+use mollusk_svm::{result::Check, Mollusk, MolluskContext};
+use solana_sdk::{
+    account::Account,
+    instruction::{AccountMeta, Instruction},
+    program_error::ProgramError,
+    program_option::COption,
+    program_pack::Pack,
+    pubkey::Pubkey,
+};
+use zama_host as host;
+
+/// The stateful Mollusk context every suite drives: an account store keyed by address.
+pub type Ctx = MolluskContext<HashMap<Pubkey, Account>>;
+
+// ---------------------------------------------------------------------------
+// Fixture constants shared by every suite
+// ---------------------------------------------------------------------------
+
+/// The gateway chain the fixtures' host config points at.
+pub const GATEWAY_CHAIN_ID: u64 = 31337;
+/// EVM address of the fixtures' `InputVerification` contract (attestation domain separator).
+pub const INPUT_VERIFICATION_CONTRACT: [u8; 20] = [0xCDu8; 20];
+/// EVM address of the fixtures' `Decryption` contract (KMS cert domain separator).
+pub const DECRYPTION_CONTRACT: [u8; 20] = [0xDEu8; 20];
+/// FHE type tag of a `euint64` balance — the type every amount fixture uses.
+pub const BALANCE_FHE_TYPE: u8 = zama_fhe::FheType::UINT64.byte();
+/// Decimals of every fixture SPL mint.
+pub const DECIMALS: u8 = 6;
+
+// ---------------------------------------------------------------------------
+// Mollusk environment
+// ---------------------------------------------------------------------------
+
+/// Boots a Mollusk with `program` registered, resolving SBF artifacts from
+/// `solana/target/deploy` (build them with `bash scripts/check-zama-host-idl.sh` first; a stale
+/// `.so` fails on an unrelated missing account rather than on anything a test asserts).
+///
+/// Suites register further programs on the returned value and raise the compute budget where
+/// their instructions need it.
+pub fn svm(program_id: &Pubkey, program_name: &str) -> Mollusk {
+    // The kit sits directly under `solana/`, so `../target/deploy` from its manifest is the
+    // workspace deploy dir; moving the crate deeper would silently break this path.
+    static SET_SBF_OUT_DIR: std::sync::Once = std::sync::Once::new();
+    SET_SBF_OUT_DIR.call_once(|| {
+        let deploy_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/deploy");
+        // SAFETY: guarded by the Once, so no other thread can be mutating the environment
+        // through this path concurrently; test binaries have no other env writers.
+        unsafe {
+            std::env::set_var("SBF_OUT_DIR", deploy_dir);
+        }
+    });
+    Mollusk::new(program_id, program_name)
+}
+
+/// Runs the Mollusk at a nonzero slot with a `SlotHashes` entry below it, like a real
+/// validator. `fhe_execute` derives handle entropy from the previous bank hash, so every suite
+/// that executes it needs this; a suite with no host involvement skips it.
+pub fn set_previous_bank_hash_sysvars(mollusk: &mut Mollusk) {
+    mollusk.sysvars.clock.slot = 100;
+    mollusk.sysvars.slot_hashes =
+        solana_sdk::slot_hashes::SlotHashes::new(&[(99, solana_sdk::hash::Hash::new_unique())]);
+}
+
+/// [`svm`] for `zama-host` alone, with the previous-bank-hash sysvars in place.
+pub fn host_svm() -> Mollusk {
+    let mut mollusk = svm(&host::id(), "zama_host");
+    set_previous_bank_hash_sysvars(&mut mollusk);
+    mollusk
+}
+
+/// [`host_svm`] with an empty `SlotHashes` — for asserting the missing-previous-bank-hash
+/// failure path.
+pub fn host_svm_without_previous_bank_hash() -> Mollusk {
+    let mut mollusk = host_svm();
+    mollusk.sysvars.slot_hashes = solana_sdk::slot_hashes::SlotHashes::default();
+    mollusk
+}
+
+// ---------------------------------------------------------------------------
+// Anchor instruction and account plumbing
+// ---------------------------------------------------------------------------
+
+/// Builds an `Instruction` from an Anchor accounts struct and an Anchor args struct.
+pub fn anchor_ix<A, D>(program_id: Pubkey, accounts: A, args: D) -> Instruction
+where
+    A: ToAccountMetas,
+    D: InstructionData,
+{
+    Instruction {
+        program_id,
+        accounts: accounts.to_account_metas(None),
+        data: args.data(),
+    }
+}
+
+/// Serializes an Anchor account (discriminator + body) for direct account-map seeding.
+pub fn serialized_account<T: AccountSerialize>(account: T) -> Vec<u8> {
+    let mut data = Vec::new();
+    account.try_serialize(&mut data).unwrap();
+    data
+}
+
+/// `Check::err` for an Anchor `#[error_code]` variant: pass `error as u32` and the
+/// `ERROR_CODE_OFFSET` is applied here. Anchor's own `ErrorCode` variants already carry their
+/// absolute code — use [`anchor_framework_error_check`] for those.
+pub fn anchor_error_check(error_code: u32) -> Check<'static> {
+    Check::err(ProgramError::Custom(
+        anchor_lang::error::ERROR_CODE_OFFSET + error_code,
+    ))
+}
+
+/// `Check::err` for an `anchor_lang::error::ErrorCode` (framework-level, no offset).
+pub fn anchor_framework_error_check(error: anchor_lang::error::ErrorCode) -> Check<'static> {
+    Check::err(ProgramError::Custom(error as u32))
+}
+
+pub fn writable(pubkey: Pubkey) -> AccountMeta {
+    AccountMeta::new(pubkey, false)
+}
+
+pub fn readonly(pubkey: Pubkey) -> AccountMeta {
+    AccountMeta::new_readonly(pubkey, false)
+}
+
+pub fn readonly_signer(pubkey: Pubkey) -> AccountMeta {
+    AccountMeta::new_readonly(pubkey, true)
+}
+
+/// The Anchor event-CPI authority PDA of a program.
+pub fn event_authority(program_id: Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"__event_authority"], &program_id).0
+}
+
+/// Decodes a self-CPI Anchor event from inner-instruction data.
+pub fn decode_anchor_event<T>(data: &[u8]) -> Option<T>
+where
+    T: AnchorDeserialize + Discriminator,
+{
+    let event_prefix = anchor_lang::event::EVENT_IX_TAG_LE
+        .iter()
+        .copied()
+        .chain(T::DISCRIMINATOR.iter().copied())
+        .collect::<Vec<u8>>();
+    let payload = data.strip_prefix(&event_prefix[..])?;
+    T::deserialize(&mut &*payload).ok()
+}
+
+/// The 32-byte big-endian `uint256` encoding of a `u64` — scalar operands, plaintexts, and
+/// KMS-signed cleartexts all carry this shape on the wire.
+pub fn u256_be(value: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[24..].copy_from_slice(&value.to_be_bytes());
+    out
+}
+
+/// A left-aligned 32-byte label from a short name.
+pub fn label(name: &str) -> [u8; 32] {
+    let mut out = [0_u8; 32];
+    let bytes = name.as_bytes();
+    assert!(bytes.len() <= out.len());
+    out[..bytes.len()].copy_from_slice(bytes);
+    out
+}
+
+/// A canonical Solana handle: seed-filled, carrying the PoC chain id, FHE type, and version.
+pub fn handle_for_chain(seed: u8, fhe_type: u8) -> [u8; 32] {
+    let mut handle = [seed; 32];
+    handle[21] = 0;
+    handle[22..30].copy_from_slice(&host::SOLANA_POC_CHAIN_ID.to_be_bytes());
+    handle[30] = fhe_type;
+    handle[31] = host::HANDLE_VERSION;
+    handle
+}
+
+// ---------------------------------------------------------------------------
+// Plain accounts
+// ---------------------------------------------------------------------------
+
+/// A data-less system-owned account holding `lamports`.
+pub fn system_account(lamports: u64) -> Account {
+    Account {
+        lamports,
+        data: vec![],
+        owner: system_program::ID,
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+/// [`system_account`] with generous funding for payer roles.
+pub fn funded_system_account() -> Account {
+    system_account(10_000_000_000)
+}
+
+/// [`system_account`] with zero lamports, for addresses an instruction will create.
+pub fn empty_system_account() -> Account {
+    system_account(0)
+}
+
+/// A data-less account owned by `program`: an application account a store's scope can name.
+pub fn program_owned_account(program: Pubkey) -> Account {
+    Account {
+        owner: program,
+        ..system_account(1)
+    }
+}
+
+/// The system program's own executable account entry, for suites that seed it explicitly.
+pub fn system_program_account() -> Account {
+    Account {
+        lamports: 1,
+        data: b"system_program".to_vec(),
+        owner: solana_sdk::native_loader::ID,
+        executable: true,
+        rent_epoch: 0,
+    }
+}
+
+/// An initialized SPL mint at [`DECIMALS`] with the given authority and supply.
+pub fn spl_mint_account(mint_authority: Option<Pubkey>, supply: u64) -> Account {
+    let mut data = vec![0u8; spl_token::state::Mint::LEN];
+    spl_token::state::Mint::pack(
+        spl_token::state::Mint {
+            mint_authority: mint_authority.map(COption::Some).unwrap_or(COption::None),
+            supply,
+            decimals: DECIMALS,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        },
+        &mut data,
+    )
+    .unwrap();
+    Account {
+        lamports: 1_000_000_000,
+        data,
+        owner: spl_token::id(),
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+/// An initialized SPL token account holding `amount` of `mint`.
+pub fn spl_token_account(mint: Pubkey, owner: Pubkey, amount: u64) -> Account {
+    let mut data = vec![0u8; spl_token::state::Account::LEN];
+    spl_token::state::Account::pack(
+        spl_token::state::Account {
+            mint,
+            owner,
+            amount,
+            delegate: COption::None,
+            state: spl_token::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        },
+        &mut data,
+    )
+    .unwrap();
+    Account {
+        lamports: 1_000_000_000,
+        data,
+        owner: spl_token::id(),
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+/// An initialized Token-2022 mint without extensions and without a mint authority.
+pub fn token_2022_mint_account(decimals: u8) -> Account {
+    let mut data = vec![0u8; spl_token_2022::state::Mint::LEN];
+    spl_token_2022::state::Mint::pack(
+        spl_token_2022::state::Mint {
+            mint_authority: COption::None,
+            supply: 1_000_000,
+            decimals,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        },
+        &mut data,
+    )
+    .unwrap();
+    Account {
+        lamports: 1_000_000_000,
+        data,
+        owner: spl_token_2022::id(),
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+/// An initialized Token-2022 account carrying `ImmutableOwner`, the shape of a Token-2022 ATA.
+pub fn token_2022_immutable_owner_account(
+    mint: Pubkey,
+    owner: Pubkey,
+    amount: u64,
+    account_state: spl_token_2022::state::AccountState,
+) -> Account {
+    use spl_token_2022::extension::{
+        immutable_owner::ImmutableOwner, BaseStateWithExtensionsMut, ExtensionType,
+        StateWithExtensionsMut,
+    };
+    let len = ExtensionType::try_calculate_account_len::<spl_token_2022::state::Account>(&[
+        ExtensionType::ImmutableOwner,
+    ])
+    .unwrap();
+    let mut data = vec![0u8; len];
+    let mut state =
+        StateWithExtensionsMut::<spl_token_2022::state::Account>::unpack_uninitialized(&mut data)
+            .unwrap();
+    state.base = spl_token_2022::state::Account {
+        mint,
+        owner,
+        amount,
+        delegate: COption::None,
+        state: account_state,
+        is_native: COption::None,
+        delegated_amount: 0,
+        close_authority: COption::None,
+    };
+    state.init_extension::<ImmutableOwner>(true).unwrap();
+    state.init_account_type().unwrap();
+    state.pack_base();
+    Account {
+        lamports: 1_000_000_000,
+        data,
+        owner: spl_token_2022::id(),
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Context store access
+// ---------------------------------------------------------------------------
+
+/// Reads and deserializes an Anchor account from the context store.
+pub fn read_account<T: AccountDeserialize>(context: &Ctx, address: Pubkey) -> T {
+    let account = context
+        .account_store
+        .borrow()
+        .get(&address)
+        .expect("missing account in context store")
+        .clone();
+    T::try_deserialize(&mut account.data.as_slice()).expect("account should deserialize")
+}
+
+/// Reads the canonical `EncryptedStore` at `address` from the context store.
+pub fn read_encrypted_store(context: &Ctx, address: Pubkey) -> host::EncryptedStore {
+    read_account(context, address)
+}
+
+/// Reads one required slot handle from a canonical encrypted store.
+pub fn read_store_handle(context: &Ctx, address: Pubkey, key: [u8; 32]) -> [u8; 32] {
+    read_encrypted_store(context, address)
+        .get(&key)
+        .expect("encrypted store slot should exist")
+}
+
+/// Amount held by the token account at `address` — classic SPL Token or Token-2022, decided by
+/// the account's owner.
+pub fn read_spl_amount(context: &Ctx, address: Pubkey) -> u64 {
+    let store = context.account_store.borrow();
+    let account = store.get(&address).expect("missing spl token account");
+    if account.owner == spl_token::id() {
+        spl_token::state::Account::unpack(&account.data)
+            .expect("valid classic token account")
+            .amount
+    } else {
+        use anchor_spl::token_2022::spl_token_2022;
+        use spl_token_2022::extension::StateWithExtensions;
+        StateWithExtensions::<spl_token_2022::state::Account>::unpack(&account.data)
+            .expect("valid Token-2022 account")
+            .base
+            .amount
+    }
+}
+
+/// Supply of the SPL mint at `address`.
+pub fn read_mint_supply(context: &Ctx, address: Pubkey) -> u64 {
+    let store = context.account_store.borrow();
+    let account = store.get(&address).expect("missing spl mint");
+    spl_token::state::Mint::unpack(&account.data)
+        .expect("valid spl mint")
+        .supply
+}
+
+/// Inserts fresh, empty system accounts for addresses an instruction will
+/// create (Mollusk requires every referenced account to exist in the store).
+pub fn ensure_system_accounts(context: &Ctx, addresses: &[Pubkey]) {
+    let mut store = context.account_store.borrow_mut();
+    for address in addresses {
+        store.entry(*address).or_insert_with(empty_system_account);
+    }
+}
+
+/// True when `address` is absent or a data-less system-owned account (a closed account).
+pub fn account_is_system_owned_and_empty(context: &Ctx, address: Pubkey) -> bool {
+    match context.account_store.borrow().get(&address) {
+        None => true,
+        Some(account) => account.owner == system_program::ID && account.data.is_empty(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// zama-host fixture accounts
+// ---------------------------------------------------------------------------
+
+/// Parameters for a fixture `HostConfig`. Defaults describe the common single-signer,
+/// unrestricted-HCU config; suites override only what a test varies.
+pub struct HostConfigParams {
+    pub admin: Pubkey,
+    pub coprocessor_signers: Vec<[u8; 20]>,
+    pub coprocessor_threshold: u8,
+    pub current_kms_context_id: [u8; 32],
+    pub current_kms_epoch_id: [u8; 32],
+    pub paused: host::PauseFlags,
+    pub grant_deny_list_enabled: bool,
+    pub hcu_block_cap_per_app: u64,
+}
+
+/// The fixture's default coprocessor signer: a dead address no test key can produce. A config
+/// built from the defaults therefore rejects every `fromExternal` attestation until a suite opts
+/// in via [`coprocessor_signer_address`], which keeps that trust visible at the call site instead
+/// of inherited silently from the kit.
+pub const UNTRUSTED_COPROCESSOR_SIGNER: [u8; 20] = [0x11; 20];
+
+/// EVM address of [`signing::coprocessor_signing_key`] — the signer set a suite registers when it
+/// mints attestations with [`signing::amount_attestation_for`].
+pub fn coprocessor_signer_address() -> [u8; 20] {
+    signing::secp_evm_address(&signing::coprocessor_signing_key())
+}
+
+impl HostConfigParams {
+    /// Defaults register [`UNTRUSTED_COPROCESSOR_SIGNER`], so a suite that mints attestations with
+    /// [`signing::amount_attestation_for`] has to register [`coprocessor_signer_address`]
+    /// explicitly. Suites that never exercise `fromExternal` inherit a config that trusts nobody.
+    pub fn new(admin: Pubkey) -> Self {
+        Self {
+            admin,
+            coprocessor_signers: vec![UNTRUSTED_COPROCESSOR_SIGNER],
+            coprocessor_threshold: 1,
+            current_kms_context_id: [0u8; 32],
+            current_kms_epoch_id: [0u8; 32],
+            paused: host::PauseFlags::default(),
+            grant_deny_list_enabled: false,
+            hcu_block_cap_per_app: u64::MAX,
+        }
+    }
+}
+
+/// Builds the fixture `HostConfig` account at its canonical PDA.
+pub fn host_config_account(params: &HostConfigParams) -> (Pubkey, Account) {
+    let (host_config, bump) = host::host_config_address();
+    (
+        host_config,
+        Account {
+            lamports: 1_000_000_000,
+            data: serialized_account(host::HostConfig {
+                admin: params.admin,
+                chain_id: host::SOLANA_POC_CHAIN_ID,
+                gateway_chain_id: GATEWAY_CHAIN_ID,
+                input_verification_contract: INPUT_VERIFICATION_CONTRACT,
+                coprocessor_signers: host::pack_coprocessor_signers(&params.coprocessor_signers),
+                coprocessor_signer_count: params.coprocessor_signers.len() as u8,
+                coprocessor_threshold: params.coprocessor_threshold,
+                decryption_contract: DECRYPTION_CONTRACT,
+                current_kms_context_id: params.current_kms_context_id,
+                current_kms_epoch_id: params.current_kms_epoch_id,
+                paused: params.paused,
+                grant_deny_list_enabled: params.grant_deny_list_enabled,
+                max_hcu_per_tx: u64::MAX,
+                max_hcu_depth_per_tx: u64::MAX,
+                hcu_block_cap_per_app: params.hcu_block_cap_per_app,
+                bump,
+            }),
+            owner: host::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+}
+
+/// The same `HostConfig` account with the areas `areas` names paused.
+pub fn paused_host_config(account: &Account, areas: host::PauseFlags) -> Account {
+    let mut config = host::HostConfig::try_deserialize(&mut account.data.as_slice())
+        .expect("host config deserializes");
+    config.paused = areas;
+    Account {
+        data: serialized_account(config),
+        ..account.clone()
+    }
+}
+
+/// Test KMS context id: 31 zero bytes and last byte `n`. `n = 0` is the reserved all-zero id.
+pub fn canonical_test_context_id(n: u8) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    id[31] = n;
+    id
+}
+
+/// Test KMS epoch id, shaped like [`canonical_test_context_id`]. `n = 0` is the all-zero id a
+/// host holds before its first context.
+pub fn canonical_test_epoch_id(n: u8) -> [u8; 32] {
+    canonical_test_context_id(n)
+}
+
+/// The host program's BPF upgradeable `ProgramData` account at its canonical address, with
+/// `upgrade_authority` as the upgrade authority (`None` for a finalized program).
+pub fn program_data_account(upgrade_authority: Option<Pubkey>) -> (Pubkey, Account) {
+    let state = UpgradeableLoaderState::ProgramData {
+        slot: 0,
+        upgrade_authority_address: upgrade_authority,
+    };
+    (
+        bpf_loader_upgradeable::get_program_data_address(&host::ID),
+        Account {
+            lamports: 1_000_000_000,
+            data: bincode::serialize(&state).expect("ProgramData serializes"),
+            owner: bpf_loader_upgradeable::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+}
+
+/// Builds a fixture `KmsContext` account at its canonical PDA, with every threshold set to
+/// `threshold`.
+pub fn kms_context_account(
+    context_id: [u8; 32],
+    signers: Vec<[u8; 20]>,
+    threshold: u8,
+) -> (Pubkey, Account) {
+    let (address, bump) = host::kms_context_address(context_id);
+    (
+        address,
+        Account {
+            lamports: 1_000_000_000,
+            data: serialized_account(host::KmsContext {
+                context_id,
+                signers,
+                thresholds: host::KmsThresholds {
+                    public_decryption: threshold,
+                    user_decryption: threshold,
+                    kms_gen: threshold,
+                    mpc: threshold,
+                },
+                destroyed: false,
+                bump,
+            }),
+            owner: host::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+}
+
+/// Builds the host's `RandNonce` account at its canonical PDA, at `nonce`.
+pub fn rand_nonce_account(nonce: u64) -> (Pubkey, Account) {
+    let (address, bump) = host::rand_nonce_address();
+    (
+        address,
+        Account {
+            lamports: 1_000_000_000,
+            data: serialized_account(host::RandNonce { nonce, bump }),
+            owner: host::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+}
+
+/// Builds a `DenyScopeRecord` account for one application at its canonical PDA.
+pub fn deny_scope_record_account(app: host::AppScope, denied: bool) -> (Pubkey, Account) {
+    let (record, bump) = host::deny_scope_address(app);
+    (
+        record,
+        Account {
+            lamports: 1_000_000_000,
+            data: serialized_account(host::DenyScopeRecord {
+                program: app.program,
+                scope: app.scope,
+                denied,
+                bump,
+            }),
+            owner: host::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+}
+
+/// Builds an `HcuTrustedAppRecord` account for one application at its canonical PDA.
+pub fn hcu_trusted_app_record_account(app: host::AppScope, trusted: bool) -> (Pubkey, Account) {
+    let (record, bump) = host::hcu_trusted_app_address(app);
+    (
+        record,
+        Account {
+            lamports: 1_000_000_000,
+            data: serialized_account(host::HcuTrustedAppRecord {
+                program: app.program,
+                scope: app.scope,
+                trusted,
+                bump,
+            }),
+            owner: host::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+}
+
+/// Builds a `PauserRecord` account for one key at its canonical PDA.
+pub fn pauser_record_account(pauser: Pubkey, enabled: bool) -> (Pubkey, Account) {
+    let (record, bump) = host::pauser_address(pauser);
+    (
+        record,
+        Account {
+            lamports: 1_000_000_000,
+            data: serialized_account(host::PauserRecord {
+                pauser,
+                enabled,
+                bump,
+            }),
+            owner: host::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+}
+
+/// Builds a canonical encrypted store with the supplied initial slots and no
+/// ACL history.
+pub fn new_encrypted_store(
+    app: host::AppScope,
+    authority: Pubkey,
+    slots: impl IntoIterator<Item = ([u8; 32], [u8; 32])>,
+) -> (Pubkey, host::EncryptedStore) {
+    let (address, bump) = host::encrypted_store_address(app.program, authority, app.scope);
+    let state = host::EncryptedStore {
+        program: app.program,
+        authority,
+        scope: app.scope,
+        slots: slots
+            .into_iter()
+            .map(|(key, handle)| host::EncryptedSlot { key, handle })
+            .collect(),
+        leaf_count: 0,
+        peaks: Vec::new(),
+        bump,
+    };
+    (address, state)
+}
+
+/// Builds a canonical encrypted store containing one initial slot.
+pub fn new_encrypted_store_with_slot(
+    app: host::AppScope,
+    authority: Pubkey,
+    key: [u8; 32],
+    handle: [u8; 32],
+) -> (Pubkey, host::EncryptedStore) {
+    new_encrypted_store(app, authority, [(key, handle)])
+}
+
+/// Wraps an `EncryptedStore` into an account entry for direct fixture seeding.
+pub fn encrypted_store_account(state: &host::EncryptedStore) -> Account {
+    Account {
+        lamports: 10_000_000_000,
+        data: serialized_account(state.clone()),
+        owner: host::id(),
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fhe_execute wire decoding
+// ---------------------------------------------------------------------------
+
+/// Decodes `FheExecuteArgs` out of raw `fhe_execute` instruction data, `None` for any other
+/// instruction.
+pub(crate) fn decode_fhe_execute_args(data: &[u8]) -> Option<host::FheExecuteArgs> {
+    let payload = data.strip_prefix(host::instruction::FheExecute::DISCRIMINATOR)?;
+    host::FheExecuteArgs::deserialize(&mut &*payload).ok()
+}

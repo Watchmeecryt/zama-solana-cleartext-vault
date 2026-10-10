@@ -1,0 +1,157 @@
+//! Event types for ZamaHost. An event is either emitted through the event CPI or not emitted at all,
+//! and which one it gets depends on whether an off-chain component has to be able to query it (DD-044).
+//!
+//! - **Emitted, always, through the event CPI** (`crate::event_cpi`). Two groups qualify. The admin and
+//!   config lifecycle — `HostConfig*`, `*KmsContext*`, `NewKmsEpoch`, `DenyScopeUpdated`, `HcuAppTrustUpdated`, `PauserUpdated` —
+//!   because an admin change is a protocol-level fact a component must be able to read without
+//!   replaying instruction data to find it. And `FheExecutedEvent`, emitted by every `fhe_execute`:
+//!   the instruction carries what the caller asked for, and the event carries what the host decided
+//!   — the block context, the random seeds and the result handle of each step. An indexer cannot
+//!   recompute the seeds, and it should not depend on its own copy of the handle derivation or on
+//!   live sysvar state to learn the rest, so a block from any archive is enough to ingest it.
+//!   Nothing here uses `emit!`: a log can be truncated by the RPC provider a reader goes
+//!   through, so it delivers a hint rather than the event. Authorization still comes from host-owned account state and never from
+//!   event bytes; what the event CPI buys is that a reader sees the change, not that it may trust it.
+//! - **Not emitted at all.** Everything else, which is most of it: per-step compute shapes and
+//!   operands (they live in `records.rs` as decoded op records), `EncryptedStore` ACL mutations (indexers rebuild MMR
+//!   leaves through the shared `zama_solana_acl` crate). The listener reconstructs these from
+//!   instruction data over Yellowstone, which is the normal path for anything reconstructible.
+//!   User-decryption delegation has no event either: delegating is a user ability rather than
+//!   administration, and the KMS connector reads the delegation record from account state
+//!   (INVARIANTS #27).
+
+use anchor_lang::prelude::*;
+
+use crate::state::PauseFlags;
+
+/// One host-derived random seed used by an `fhe_execute` step.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq, Eq)]
+pub struct FheExecuteRandomSeed {
+    /// Zero-based step index within the execution.
+    pub step_index: u16,
+    /// Seed derived from the consumed host rand nonce and slot entropy.
+    pub seed: [u8; 16],
+}
+
+/// Emitted once by every `fhe_execute`, after its account writes.
+#[event]
+pub struct FheExecutedEvent {
+    /// Event schema version.
+    pub version: u8,
+    /// Bank hash of the parent slot, folded into every deterministic result handle.
+    pub previous_bank_hash: [u8; 32],
+    /// The slot's `Clock::unix_timestamp`, folded into every deterministic result handle.
+    pub unix_timestamp: i64,
+    /// Result handle of each step, in step order.
+    pub results: Vec<[u8; 32]>,
+    /// Seeds of the random steps, in step order.
+    pub seeds: Vec<FheExecuteRandomSeed>,
+}
+
+/// Emitted when host config flags change.
+#[event]
+pub struct HostConfigUpdatedEvent {
+    /// Event schema version.
+    pub version: u8,
+    /// Host config PDA.
+    pub config: Pubkey,
+    /// Signer that performed the update: the admin, or a pauser for `pause`.
+    pub signer: Pubkey,
+    /// Host areas currently paused.
+    pub paused: PauseFlags,
+    /// Current deny-list gate.
+    pub grant_deny_list_enabled: bool,
+    /// Current max total HCU per transaction (`u64::MAX` = unlimited).
+    pub max_hcu_per_tx: u64,
+    /// Current max critical-path HCU per transaction (`u64::MAX` = unlimited).
+    pub max_hcu_depth_per_tx: u64,
+    /// Current per-app HCU block cap (`u64::MAX` = unrestricted, `0` = ban untrusted apps).
+    pub hcu_block_cap_per_app: u64,
+}
+
+/// Emitted when a KMS context is defined (mirrors `ProtocolConfig.NewKmsContext`).
+#[event]
+pub struct NewKmsContextEvent {
+    /// Event schema version.
+    pub version: u8,
+    /// The new context id.
+    pub kms_context_id: [u8; 32],
+    /// The epoch activated with it.
+    pub kms_epoch_id: [u8; 32],
+    /// KMS node signer EVM addresses authorized in this context.
+    pub signers: Vec<[u8; 20]>,
+    /// Public-decrypt signature threshold.
+    pub public_decryption_threshold: u8,
+    /// User-decrypt signature threshold.
+    pub user_decryption_threshold: u8,
+}
+
+/// Emitted when a new epoch of the active KMS context is activated (mirrors
+/// `ProtocolConfig.MirrorKmsEpoch`).
+#[event]
+pub struct NewKmsEpochEvent {
+    /// Event schema version.
+    pub version: u8,
+    /// The active context id.
+    pub kms_context_id: [u8; 32],
+    /// The new epoch id.
+    pub kms_epoch_id: [u8; 32],
+}
+
+/// Emitted when a KMS context is destroyed (mirrors `ProtocolConfig.KmsContextDestroyed`).
+#[event]
+pub struct KmsContextDestroyedEvent {
+    /// Event schema version.
+    pub version: u8,
+    /// The destroyed context id.
+    pub kms_context_id: [u8; 32],
+}
+
+/// Emitted when an application deny-list record is updated.
+#[event]
+pub struct DenyScopeUpdatedEvent {
+    /// Event schema version.
+    pub version: u8,
+    /// Canonical deny-list record PDA.
+    pub deny_scope_record: Pubkey,
+    /// The application program governed by the record.
+    pub program: Pubkey,
+    /// The scope governed by the record: an account of `program`.
+    pub scope: Pubkey,
+    /// Whether the application is denied.
+    pub denied: bool,
+    /// Slot in which this update was applied.
+    pub updated_slot: u64,
+}
+
+/// Emitted when a pauser record is created or toggled.
+#[event]
+pub struct PauserUpdatedEvent {
+    /// Event schema version.
+    pub version: u8,
+    /// Canonical pauser record PDA.
+    pub pauser_record: Pubkey,
+    /// The key the record grants.
+    pub pauser: Pubkey,
+    /// Whether the key may set pause flags.
+    pub enabled: bool,
+    /// Slot in which this update was applied.
+    pub updated_slot: u64,
+}
+
+/// Emitted when an application's HCU block-cap trust registry entry is updated.
+#[event]
+pub struct HcuAppTrustUpdatedEvent {
+    /// Event schema version.
+    pub version: u8,
+    /// Canonical trust-registry record PDA.
+    pub hcu_trusted_app_record: Pubkey,
+    /// The application program governed by the record.
+    pub program: Pubkey,
+    /// The scope governed by the record: an account of `program`.
+    pub scope: Pubkey,
+    /// Whether the application bypasses the per-app block cap.
+    pub trusted: bool,
+    /// Slot in which this update was applied.
+    pub updated_slot: u64,
+}

@@ -1,0 +1,144 @@
+//! Initializes confidential token accounts and their zero-balance handles.
+
+use super::*;
+
+/// Accounts for initializing a confidential token account.
+#[derive(Accounts)]
+#[event_cpi]
+pub struct InitializeTokenAccount<'info> {
+    /// Pays rent for the token account and its initial encrypted balance.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// Account owner. The canonical token-account PDA, stored owner, and the key allowed to
+    /// decrypt the balance are all derived from this address.
+    /// CHECK: This account is used only as a public key.
+    pub owner: UncheckedAccount<'info>,
+    /// Confidential mint this account belongs to.
+    pub mint: Account<'info, ConfidentialMint>,
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 8 + ConfidentialTokenAccount::SPACE,
+        seeds = [b"token-account", mint.key().as_ref(), owner.key().as_ref()],
+        bump
+    )]
+    pub token_account: Account<'info, ConfidentialTokenAccount>,
+    /// CHECK: initialized and validated by the Zama host program CPI.
+    #[account(mut)]
+    pub balance_encrypted_store: UncheckedAccount<'info>,
+    /// CHECK: Anchor event CPI authority for the Zama host program.
+    #[account(seeds = [b"__event_authority"], bump = zama_host::EVENT_AUTHORITY_AND_BUMP.1, seeds::program = zama_host::ID)]
+    pub zama_event_authority: UncheckedAccount<'info>,
+    /// CHECK: shared transaction transient store, validated by ZamaHost.
+    #[account(mut)]
+    pub transient_store: UncheckedAccount<'info>,
+    /// CHECK: runtime Instructions sysvar, validated by ZamaHost.
+    pub instructions: UncheckedAccount<'info>,
+    /// ZamaHost program used to create the initial balance handle.
+    pub zama_program: Program<'info, ZamaHost>,
+    /// ZamaHost config used for handle derivation.
+    #[account(seeds = [zama_host::HOST_CONFIG_SEED], bump = host_config.bump, seeds::program = zama_host::ID)]
+    pub host_config: Account<'info, zama_host::HostConfig>,
+    /// System program used for account creation.
+    pub system_program: Program<'info, System>,
+    /// CHECK: forwarded verbatim into the ZamaHost `fhe_execute` CPI, which validates it against the
+    /// canonical `["hcu-block-meter", program, mint]` PDA. Supplied by an untrusted mint under a
+    /// metering-band cap; omitted when the mint is trusted or the cap is unrestricted.
+    #[account(mut)]
+    pub hcu_block_meter: Option<UncheckedAccount<'info>>,
+    /// CHECK: forwarded verbatim into the ZamaHost `fhe_execute` CPI, which validates it against the
+    /// canonical `["hcu-trusted", program, mint]` PDA. Present + valid bypasses the cap; absent
+    /// means the mint is metered.
+    pub hcu_trusted_app_record: Option<UncheckedAccount<'info>>,
+}
+
+/// Initializes a token account and creates its zero confidential balance handle, or leaves an
+/// existing one unchanged.
+pub fn initialize_token_account<'info>(
+    ctx: Context<'info, InitializeTokenAccount<'info>>,
+) -> Result<()> {
+    assert_confidential_mint_shape(&ctx.accounts.mint)?;
+    // An account this call creates is zeroed; one that existed holds its mint. The owner need not
+    // sign, so anyone can create an account first: `open_batch` must still succeed, and the existing
+    // balance must not be replaced by a new zero.
+    if ctx.accounts.token_account.mint == ctx.accounts.mint.key() {
+        return Ok(());
+    }
+    {
+        let token_account = &mut ctx.accounts.token_account;
+        token_account.owner = ctx.accounts.owner.key();
+        token_account.mint = ctx.accounts.mint.key();
+        token_account.bump = ctx.bumps.token_account;
+    }
+    let mint_key = ctx.accounts.mint.key();
+    let owner = ctx.accounts.owner.key();
+    let token_account_key = ctx.accounts.token_account.key();
+    let balance_encrypted_store = ctx.accounts.balance_encrypted_store.key();
+    let authority = fhe::StoreAuthority::token_account(&ctx.accounts.token_account);
+    authority.create_state(
+        ctx.accounts.mint.to_account_info(),
+        ctx.accounts.balance_encrypted_store.to_account_info(),
+        ctx.accounts.payer.to_account_info(),
+        ctx.accounts.host_config.to_account_info(),
+        ctx.accounts.system_program.to_account_info(),
+    )?;
+    let balance_output = fhe::SlotOutput::new(
+        ctx.accounts.balance_encrypted_store.to_account_info(),
+        balance_slot(mint_key, token_account_key),
+        &authority,
+        [owner],
+    )?;
+    let execution =
+        zama_fhe::FheExecution::build(balance_slot(mint_key, token_account_key).0, |builder| {
+            let new_balance = builder.trivial_encrypt_u64(0)?;
+            builder.output(new_balance, balance_output.output())?;
+            Ok(())
+        })?;
+    let execution_accounts = fhe::ExecutionAccountSet::for_execution(
+        &execution,
+        [balance_output.account_info()],
+        [authority],
+    )?;
+    fhe::execute(fhe::Execute {
+        context: fhe::ExecuteContext {
+            payer: &ctx.accounts.payer,
+            event_authority: &ctx.accounts.zama_event_authority,
+            transient_store: &ctx.accounts.transient_store,
+            instructions: &ctx.accounts.instructions,
+            zama_program: &ctx.accounts.zama_program,
+            host_config: &ctx.accounts.host_config,
+            deny_scope_records: fhe::deny_scope_records(
+                &ctx.accounts.host_config,
+                ctx.remaining_accounts,
+                [token_app(mint_key)],
+            )?,
+            system_program: &ctx.accounts.system_program,
+            hcu_block_meter: ctx
+                .accounts
+                .hcu_block_meter
+                .as_ref()
+                .map(|account| account.to_account_info()),
+            hcu_trusted_app_record: ctx
+                .accounts
+                .hcu_trusted_app_record
+                .as_ref()
+                .map(|account| account.to_account_info()),
+        },
+        accounts: &execution_accounts,
+        execution,
+    })?;
+    let balance_handle = balance_output.handle()?;
+    let token_account = &mut ctx.accounts.token_account;
+    emit_cpi!(BalanceHandleUpdatedEvent {
+        version: APP_EVENT_VERSION,
+        mint: ctx.accounts.mint.key(),
+        owner: ctx.accounts.owner.key(),
+        token_account: token_account.key(),
+        old_handle: [0; 32],
+        old_encrypted_store: Pubkey::default(),
+        new_handle: balance_handle,
+        new_encrypted_store: balance_encrypted_store,
+        reason: BalanceHandleUpdateReason::Initialize,
+    });
+    Ok(())
+}

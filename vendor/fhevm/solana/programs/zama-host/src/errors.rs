@@ -1,0 +1,315 @@
+//! Program errors for the ZamaHost Anchor program.
+//!
+//! Error names are part of the client-facing Anchor IDL. Keep them specific to
+//! the failed invariant so tests and off-chain tooling can assert on the reason
+//! without parsing logs.
+
+use anchor_lang::prelude::*;
+
+/// Errors returned by ZamaHost instruction handlers.
+#[error_code]
+pub enum ZamaHostError {
+    /// The signer is not the configured host admin.
+    #[msg("host config admin does not match signer")]
+    HostConfigAdminMismatch,
+    /// `fhe_execute` was attempted while execution is paused.
+    #[msg("host execution is paused")]
+    ExecutionPaused,
+    /// The host config account is not the canonical singleton or has invalid shape.
+    #[msg("host config account is invalid")]
+    HostConfigMismatch,
+    /// The instruction included undeclared trailing account metas.
+    #[msg("instruction has unexpected remaining accounts")]
+    UnexpectedRemainingAccounts,
+    /// The attestation's handle list is empty or oversized, or its extra data exceeds the limit.
+    #[msg("input attestation payload is malformed")]
+    MalformedInputAttestation,
+    /// The selected input handle index is outside the attestation handle list.
+    #[msg("attestation handle index is invalid")]
+    InvalidInputHandleIndex,
+    /// The selected input handle does not match the requested handle.
+    #[msg("attestation selected handle does not match")]
+    InvalidInputHandle,
+    /// The coprocessor EIP-712 input attestation failed secp256k1 threshold verification.
+    #[msg("coprocessor input attestation is invalid")]
+    InvalidInputAttestation,
+    /// The gateway verifier config (coprocessor signer / verifying contract) is unset.
+    #[msg("gateway verifier config is not set")]
+    GatewayVerifierConfigUnset,
+    /// A KMS context must define at least one signer.
+    #[msg("KMS context has no signers")]
+    EmptyKmsContext,
+    /// A KMS context exceeds the maximum supported signer count.
+    #[msg("KMS context exceeds the maximum signer count")]
+    TooManyKmsSigners,
+    /// A KMS threshold is zero or exceeds the signer count.
+    #[msg("KMS context threshold is invalid")]
+    InvalidKmsThreshold,
+    /// A new KMS context id is not above the current one (EVM `NonIncreasingKmsContextId`). The
+    /// current id starts at all-zero, so the all-zero id is never accepted.
+    #[msg("KMS context id must be above the current one")]
+    NonIncreasingKmsContextId,
+    /// The current active KMS context cannot be destroyed.
+    #[msg("current KMS context cannot be destroyed")]
+    CurrentKmsContextCannotBeDestroyed,
+    /// The input handle version byte is unsupported.
+    #[msg("input handle version is unsupported")]
+    InvalidInputHandleVersion,
+    /// The input handle chain id does not match host config.
+    #[msg("input handle chain id does not match host config")]
+    InvalidInputHandleChain,
+    /// The input handle FHE type id is unsupported.
+    #[msg("input handle FHE type is unsupported")]
+    InvalidInputHandleType,
+    /// The requested FHE type id is unsupported.
+    #[msg("FHE type is unsupported")]
+    UnsupportedFheType,
+    /// A binary operation operand type does not match the operation type.
+    #[msg("binary FHE operand type is incompatible")]
+    BinaryOperandTypeMismatch,
+    /// A bounded random request has an invalid upper bound.
+    #[msg("bounded random upper bound is invalid")]
+    InvalidRandomUpperBound,
+    /// The signer for an output does not match the encrypted store authority the
+    /// execution declared for it, or a persistent operand's authority did not sign.
+    #[msg("signer does not match the encrypted store authority")]
+    EncryptedStoreAccountAuthorityMismatch,
+    /// A create's authority seeds do not derive the declared authority under the declared
+    /// program: the authority is not that program's PDA.
+    #[msg("encrypted value authority is not a PDA of the declared program")]
+    EncryptedStoreAuthorityNotProgramPda,
+    /// A deny-list witness is required but was not supplied.
+    #[msg("deny-list witness account is required")]
+    DenyRecordMissing,
+    /// A deny-list witness is not canonical or has invalid contents.
+    #[msg("deny-list account does not match the canonical PDA")]
+    DenyRecordMismatch,
+    /// The application `(program, scope)` is denied: it can neither compute nor allow.
+    #[msg("application scope is deny-listed")]
+    ScopeDenied,
+    /// A delegation tuple is self-referential, expired, or otherwise invalid.
+    #[msg("delegation tuple is invalid")]
+    InvalidDelegation,
+    /// A revocation found no grant: the record was revoked already, as EVM's `NotDelegatedYet`.
+    #[msg("delegation is not granted")]
+    NotDelegatedYet,
+    /// Delegation state was already updated in the current slot.
+    #[msg("delegation was already updated in the current slot")]
+    DelegationUpdatedInCurrentSlot,
+    /// The slot-hash sysvar did not contain the expected previous hash.
+    #[msg("previous bank hash is not available")]
+    PreviousBankHashUnavailable,
+    /// A PDA account was not fresh or canonical after creation.
+    #[msg("PDA creation target is invalid")]
+    PdaCreationMismatch,
+    /// An fhe_execute instruction exceeded the supported operation count.
+    #[msg("fhe_execute operation count is invalid")]
+    InvalidFheExecuteOperationCount,
+    /// An fhe_execute instruction referenced a missing or malformed dynamic account.
+    #[msg("fhe_execute account reference is invalid")]
+    InvalidFheExecuteAccount,
+    /// An fhe_execute instruction referenced a step output that no earlier step produced.
+    #[msg("fhe_execute transient operand is missing")]
+    FheExecuteEarlierStepMissing,
+    /// An fhe_execute persistent output account already exists.
+    #[msg("fhe_execute persistent output ACL record already exists")]
+    FheExecuteOutputAlreadyInitialized,
+    /// An execution containing a rand step did not pass the host's rand nonce account.
+    #[msg("fhe_execute rand step requires the rand nonce account")]
+    FheExecuteRandNonceMissing,
+    /// A KMS context was defined with a duplicate signer address.
+    #[msg("KMS context signer set contains a duplicate address")]
+    DuplicateKmsSigner,
+    /// The coprocessor-attested contract does not match the execution's application program.
+    #[msg("attested contract address does not match the execution's program")]
+    InputBindContractMismatch,
+    /// The transaction's summed HCU exceeds `max_hcu_per_tx` (or the running sum overflowed).
+    #[msg("FHE op total HCU exceeds the per-transaction limit")]
+    HcuTransactionLimitExceeded,
+    /// A value's critical-path HCU in the transaction exceeds `max_hcu_depth_per_tx` (or the depth sum
+    /// overflowed).
+    #[msg("FHE op depth HCU exceeds the per-transaction depth limit")]
+    HcuTransactionDepthLimitExceeded,
+    /// The HCU cost table has no row for this op / FHE type / scalar combination (fail-closed).
+    #[msg("no HCU cost is defined for this op / type / scalar combination")]
+    HcuUnknownCost,
+    /// A limit setter would violate the ordering invariant `max_hcu_per_tx >= max_hcu_depth_per_tx`.
+    #[msg("HCU limits violate max_hcu_per_tx >= max_hcu_depth_per_tx")]
+    HcuLimitOrderingInvalid,
+    /// The attested `contract_chain_id` does not match the host chain id (EVM `contractChainId == block.chainid`).
+    #[msg("attested contract chain id does not match the host chain id")]
+    AttestationChainIdMismatch,
+    // ---- EncryptedStore ACL model ----
+    /// An `EncryptedStore` account is not the canonical PDA for its identity seeds.
+    #[msg("encrypted store does not match the canonical PDA")]
+    EncryptedStorePdaMismatch,
+    /// The declared previous handle did not match the account's current handle: a create on an
+    /// existing value, an update on a fresh one, or an update built on stale state.
+    #[msg("encrypted value previous handle does not match the account")]
+    PreviousStoreMismatch,
+    /// `make_handle_public` named a handle that is not the account's current handle.
+    #[msg("encrypted value public handle does not match the account")]
+    EncryptedStorePublicHandleMismatch,
+    /// An allowed key is the zero key or repeats another key of the same output.
+    #[msg("encrypted value allowed key is invalid")]
+    InvalidAllowKey,
+    /// The MMR peaks/leaf-count invariant was violated.
+    #[msg("encrypted value MMR state is inconsistent")]
+    EncryptedStoreMmrInconsistent,
+    /// The MMR peak count reached the representational cap.
+    #[msg("encrypted value MMR peak capacity exceeded")]
+    EncryptedStoreMmrPeakCapacityExceeded,
+    /// The per-app in-slot HCU would exceed the block cap; also the `cap == 0` ban and a meter
+    /// accumulation overflow (all fail closed). Analog of EVM `HCUBlockLimitExceeded`.
+    #[msg("per-app in-slot HCU exceeds the block cap")]
+    HcuBlockLimitExceeded,
+    /// A metered (untrusted) app forwarded no block meter — fail closed rather than un-metered.
+    #[msg("HCU block meter account is required for a metered app")]
+    HcuBlockMeterMissing,
+    /// The supplied block meter is not the canonical PDA / owner / recorded app.
+    #[msg("HCU block meter account does not match the canonical PDA")]
+    HcuBlockMeterMismatch,
+    /// A present trust witness is not the canonical PDA / owner (only an absent witness is benign).
+    #[msg("HCU trusted-app record does not match the canonical PDA")]
+    HcuTrustedAppRecordMismatch,
+    /// A metering-band cap was set below `max_hcu_per_tx`, making a single legal execution impossible.
+    /// Analog of EVM `HCUPerBlockBelowMaxPerTx`.
+    #[msg("HCU block cap is below max_hcu_per_tx")]
+    HcuBlockCapBelowMaxPerTx,
+
+    /// `fheMulDiv` divisor is a plaintext scalar that must never be zero (EVM parity).
+    #[msg("fheMulDiv divisor must be non-zero")]
+    MulDivDivisorZero,
+
+    /// `fheDiv`/`fheRem` require a plaintext scalar divisor (EVM `IsNotScalar`).
+    #[msg("fheDiv/fheRem divisor must be a plaintext scalar")]
+    DivisorMustBeScalar,
+
+    /// `fheDiv`/`fheRem` divisor is zero (EVM `DivisionByZero`).
+    #[msg("fheDiv/fheRem divisor must be non-zero")]
+    DivisionByZero,
+
+    /// The host `chain_id` is not a Solana type-byte id (`0x01`), or the EVM
+    /// `gateway_chain_id` is not a uint64-padded EVM id (high byte `0x00`).
+    #[msg(
+        "host chain id must have type byte 0x01 and the gateway chain id must have type byte 0x00"
+    )]
+    InvalidChainTypeByte,
+
+    /// The persistent values one execution's default authority reads and writes belong to
+    /// different applications; one execution is metered against exactly one `(program, scope)`.
+    /// Values admitted by an additional signing authority are that program's own and do not count.
+    #[msg("FHE execution mixes values of different application scopes")]
+    FheExecuteMixedScopes,
+
+    // ---- stateless public-decrypt verifier (verify_public_decrypt, fhevm-internal#1704) ----
+    /// The supplied KMS context account is destroyed, is not the canonical PDA for the id the
+    /// certificate committed to via signed `extra_data`, or has a mismatched stored id. Verification
+    /// binds to the cert-named context (any live context), so a destroyed context — or an account
+    /// that is not the one the cert names — fails closed here. `define_kms_epoch` also returns it
+    /// for a context that is not the active one (EVM `InvalidKmsContext`).
+    #[msg(
+        "KMS context is destroyed, not the active one, or not the certificate's committed context"
+    )]
+    InvalidKmsContext,
+    /// The KMS `PublicDecryptVerification` certificate failed secp256k1 threshold verification
+    /// against the cert-named context's signer set.
+    #[msg("KMS public-decrypt certificate is invalid")]
+    InvalidKmsCertificate,
+
+    /// The coprocessor signer set is empty. Input verification requires at least one registered
+    /// signer (analog of `EmptyKmsContext` for the coprocessor path).
+    #[msg("coprocessor signer set must not be empty")]
+    EmptyCoprocessorSignerSet,
+    /// The coprocessor signer set exceeds `HostConfig::MAX_COPROCESSOR_SIGNERS` (analog of
+    /// `TooManyKmsSigners`).
+    #[msg("coprocessor signer set exceeds the maximum size")]
+    TooManyCoprocessorSigners,
+    /// The coprocessor threshold is zero or greater than the signer count; a valid n-of-m needs
+    /// `1 <= threshold <= set.len()` (analog of `InvalidKmsThreshold`).
+    #[msg("coprocessor threshold must be between 1 and the signer count")]
+    InvalidCoprocessorThreshold,
+    /// The coprocessor signer set contains a duplicate address. Threshold verification counts
+    /// DISTINCT recovered signers, so a duplicate would silently raise the effective quorum
+    /// (analog of `DuplicateKmsSigner`).
+    #[msg("coprocessor signer set contains a duplicate signer")]
+    DuplicateCoprocessorSigner,
+    /// The coprocessor signer set contains the zero address, which can never be a valid recovered
+    /// EVM signer.
+    #[msg("coprocessor signer set contains the zero address")]
+    ZeroCoprocessorSigner,
+    /// The KMS signer set contains the zero address, which can never be a valid recovered EVM signer.
+    #[msg("KMS signer set contains the zero address")]
+    ZeroKmsSigner,
+    /// The runtime clock reports a time before the unix epoch. The watermark is an
+    /// unsigned number of seconds, and coercing a negative time into it would jump the
+    /// watermark to the far future and kill every permit the user will ever sign — so
+    /// this fails closed instead.
+    #[msg("clock is before the unix epoch")]
+    ClockBeforeEpoch,
+
+    /// A step referenced an interned dictionary index past the end of `FheExecuteArgs::dictionary`.
+    #[msg("fhe_execute dictionary index out of bounds")]
+    FheExecuteDictionaryIndexOutOfBounds,
+    /// `FheExecuteArgs::account_count` does not match the actual remaining-accounts length.
+    #[msg("fhe_execute declared account count mismatch")]
+    FheExecuteAccountCountMismatch,
+    /// An interned dictionary entry was never referenced by any step; an execution must not
+    /// carry dead bytes.
+    #[msg("fhe_execute dictionary entry is not referenced by any step")]
+    FheExecuteDictionaryEntryUnreferenced,
+    /// `0` is not a valid per-tx HCU limit: `u64::MAX` is the single "unlimited"
+    /// sentinel across every HCU knob, and a `0` limit would reject every execution.
+    #[msg("0 is not a valid HCU limit; use u64::MAX for unlimited")]
+    HcuLimitZeroReserved,
+    #[msg("invalid transient store account")]
+    TransientAccountInvalid,
+    #[msg("matching final top-level transient_store close is required")]
+    TransientCloseMissing,
+    #[msg("transient store grant capacity exceeded")]
+    TransientCapacityExceeded,
+    #[msg("encrypted store slot capacity exceeded")]
+    EncryptedStoreCapacityExceeded,
+    #[msg("invalid execution return selection")]
+    InvalidReturnSelection,
+    #[msg("transient store must be opened for this transaction and closed last")]
+    TransientStoreNotOpened,
+    /// A wallet delegator called `delegate_for_user_decryption` through CPI. Its signature
+    /// reaches every program of the transaction it signed, so it must delegate at the top level.
+    #[msg("a wallet delegator must delegate in a top-level instruction")]
+    WalletDelegationThroughCpi,
+    /// An execution consumed a verified input while verified inputs are paused.
+    #[msg("verified inputs are paused")]
+    VerifiedInputsPaused,
+    /// An ACL write outside an execution was attempted while ACL writes are paused.
+    #[msg("ACL writes are paused")]
+    AclWritesPaused,
+    /// The signer's pauser record is disabled.
+    #[msg("signer is not an enabled pauser")]
+    NotPauser,
+    /// A wallet pauser called `pause` through CPI. Its signature reaches every program of the
+    /// transaction it signed, so it must pause at the top level.
+    #[msg("a wallet pauser must pause in a top-level instruction")]
+    WalletPauseThroughCpi,
+    /// A create named a scope account the store's program does not own. This also refuses a
+    /// program id (the loader owns it) and the wildcard sentinel (an absent address is System-owned).
+    #[msg("encrypted store scope is not an account of the store's program")]
+    EncryptedStoreScopeNotProgramAccount,
+    /// A delegation's scope is not an account `program` owns, so no store of `program` can carry
+    /// it. The wildcard row is exempt.
+    #[msg("delegation scope is not an account of the delegated program")]
+    DelegationScopeNotProgramAccount,
+    /// A scalar operand or trivial-encrypt plaintext exceeds its FHE type's maximum (EVM
+    /// `ScalarOutOfRange`).
+    #[msg("scalar exceeds the maximum of its FHE type")]
+    ScalarOutOfRange,
+    /// A new KMS epoch id is not above the active one (EVM `NonIncreasingEpochId`). The active id
+    /// starts at all-zero, so the all-zero id is never accepted.
+    #[msg("KMS epoch id must be above the current one")]
+    NonIncreasingKmsEpochId,
+    /// A wallet called `revoke_delegation_for_user_decryption` or `revoke_permits` through CPI.
+    /// Its signature reaches every program of the transaction it signed, so it must revoke at the
+    /// top level, as EVM keys a revocation on `msg.sender`.
+    #[msg("a wallet must revoke in a top-level instruction")]
+    WalletRevokeThroughCpi,
+}

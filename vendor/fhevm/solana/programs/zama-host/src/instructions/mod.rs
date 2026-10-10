@@ -1,0 +1,63 @@
+//! Instruction account contexts and handlers for the ZamaHost program.
+//!
+//! Each instruction lives in its own module. Shared account contexts and
+//! validation helpers stay in `common` so generated Anchor account types remain
+//! re-exported from this module.
+
+mod common;
+mod transient;
+pub use transient::*;
+#[cfg(feature = "admin-sweep")]
+pub mod close_owned_accounts;
+#[cfg(feature = "admin-sweep")]
+pub use close_owned_accounts::*;
+pub mod create_encrypted_store;
+pub use create_encrypted_store::*;
+pub mod define_kms_context;
+pub mod define_kms_epoch;
+pub mod delegate_for_user_decryption;
+pub mod destroy_kms_context;
+pub mod fhe_execute;
+pub mod host_admin;
+pub mod initialize_host_config;
+pub mod input_verification;
+pub mod make_store_handle_public;
+pub mod pause;
+pub mod revoke_delegation_for_user_decryption;
+pub mod revoke_permits;
+pub mod set_admin;
+pub mod set_coprocessor_signers;
+pub mod set_deny_scope;
+pub mod set_eip712_domain;
+pub mod set_grant_deny_list_enabled;
+pub mod set_hcu_app_trusted;
+pub mod set_hcu_block_cap_per_app;
+pub mod set_max_hcu_depth_per_tx;
+pub mod set_max_hcu_per_tx;
+pub mod set_pauser;
+pub mod unpause;
+pub mod verify_public_decrypt;
+
+pub use define_kms_context::*;
+pub use define_kms_epoch::*;
+pub use delegate_for_user_decryption::*;
+pub use destroy_kms_context::*;
+pub use fhe_execute::*;
+pub use host_admin::*;
+pub use initialize_host_config::*;
+pub use make_store_handle_public::*;
+pub use pause::*;
+pub use revoke_delegation_for_user_decryption::*;
+pub use revoke_permits::*;
+pub use set_admin::*;
+pub use set_coprocessor_signers::*;
+pub use set_deny_scope::*;
+pub use set_eip712_domain::*;
+pub use set_grant_deny_list_enabled::*;
+pub use set_hcu_app_trusted::*;
+pub use set_hcu_block_cap_per_app::*;
+pub use set_max_hcu_depth_per_tx::*;
+pub use set_max_hcu_per_tx::*;
+pub use set_pauser::*;
+pub use unpause::*;
+pub use verify_public_decrypt::*;

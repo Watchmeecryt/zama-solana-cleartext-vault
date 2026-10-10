@@ -1,0 +1,523 @@
+//! Unit tests for state helpers and keccak256 handle derivation.
+//!
+//! Split out of `mod.rs` to keep that module within its form-gate size cap.
+
+use super::*;
+use zama_solana_acl::host_chain::is_solana_host_chain_id;
+
+#[test]
+fn repeated_results_keep_maximum_depth_for_every_authorized_state() {
+    use bytemuck::Zeroable;
+
+    let mut transient_store = TransientStore::zeroed();
+    let producer = Pubkey::new_unique();
+    let other_producer = Pubkey::new_unique();
+    let consumer = Pubkey::new_unique();
+    let handle = [7; 32];
+    assert_eq!(transient_store.origin_depth(handle), None);
+    transient_store.record(handle, producer, 3).unwrap();
+    transient_store.allow(handle, consumer).unwrap();
+    transient_store.record(handle, other_producer, 9).unwrap();
+    transient_store.record(handle, producer, 4).unwrap();
+    transient_store.record([8; 32], producer, 100).unwrap();
+
+    assert_eq!(transient_store.len(), 4);
+    assert_eq!(transient_store.result(0).unwrap().depth, 3);
+    assert_eq!(transient_store.origin_depth(handle), Some(9));
+    for authorized in [producer, other_producer, consumer] {
+        assert_eq!(
+            transient_store.authorized_depth(handle, authorized),
+            Some(9)
+        );
+    }
+    assert_eq!(
+        transient_store.authorized_depth(handle, Pubkey::new_unique()),
+        None
+    );
+    assert_eq!(transient_store.authorized_depth([8; 32], consumer), None);
+    assert_eq!(transient_store.authorized_depth([9; 32], consumer), None);
+}
+
+#[test]
+fn latest_prior_bank_hash_tolerates_skipped_slots() {
+    let entries = vec![(8, [8; 32]), (6, [6; 32]), (3, [3; 32])];
+
+    assert_eq!(
+        latest_prior_bank_hash_from_entries(10, entries.clone()),
+        Some([8; 32])
+    );
+    assert_eq!(
+        latest_prior_bank_hash_from_entries(8, entries.clone()),
+        Some([6; 32])
+    );
+    assert_eq!(latest_prior_bank_hash_from_entries(3, entries), None);
+}
+
+fn keccak(parts: &[&[u8]]) -> [u8; 32] {
+    keccak_hashv(parts).to_bytes()
+}
+
+fn assert_canonical_metadata(handle: [u8; 32], fhe_type: u8, chain_id: u64) {
+    assert_eq!(
+        handle[21], COMPUTED_HANDLE_MARKER,
+        "byte 21 must mark a computed handle"
+    );
+    assert_eq!(
+        &handle[22..30],
+        &chain_id.to_be_bytes(),
+        "bytes 22..30 must carry the big-endian uint64 chain id"
+    );
+    assert_eq!(handle[30], fhe_type, "byte 30 must carry the fhe type");
+    assert_eq!(
+        handle[31], HANDLE_VERSION,
+        "byte 31 must carry the handle version"
+    );
+}
+
+#[test]
+fn eval_handle_derivation_preserves_solana_chain_type_byte() {
+    // A Solana host chain id has type byte `0x01`; the derived handle must
+    // round-trip it verbatim through bytes 22..30. `SOLANA_POC_CHAIN_ID`
+    // already carries the type byte (RFC-021 / DD-052).
+    let chain_id = SOLANA_POC_CHAIN_ID;
+    let handle = computed_eval_handle(
+        FheBinaryOpCode::Sub,
+        [1; 32],
+        [2; 32],
+        true,
+        3,
+        [0; 32],
+        &HandleDerivationContext {
+            program_id: crate::ID,
+            chain_id,
+            previous_bank_hash: [9; 32],
+            unix_timestamp: 42,
+        },
+    );
+    assert_canonical_metadata(handle, 3, chain_id);
+    assert_eq!(
+        handle_chain_id(&handle),
+        chain_id,
+        "the chain id reader must recover the type byte"
+    );
+    assert!(
+        is_solana_host_chain_id(handle_chain_id(&handle)),
+        "the Solana type byte must survive derivation"
+    );
+}
+
+#[test]
+fn handle_derivation_rand_uses_keccak() {
+    let seed = [0x42; 16];
+    let chain_id = 13u64;
+    let fhe_type = 5u8;
+    let handle = computed_rand_handle(seed, fhe_type, crate::ID, chain_id);
+    let expected_prehandle = keccak(&[
+        COMPUTATION_DOMAIN_SEPARATOR,
+        &[3],
+        &[fhe_type],
+        &seed,
+        crate::ID.as_ref(),
+        &chain_id.to_be_bytes(),
+    ]);
+    assert_eq!(&handle[..21], &expected_prehandle[..21]);
+    assert_canonical_metadata(handle, fhe_type, chain_id);
+}
+
+#[test]
+fn rand_seed_is_distinct_across_every_uniqueness_axis() {
+    let app = AppScope {
+        program: Pubkey::new_unique(),
+        scope: Pubkey::new_unique(),
+    };
+    let seed = |nonce: u64, app: AppScope, op_index: u16, slot_entropy: [u8; 32]| {
+        computed_eval_rand_seed(
+            nonce,
+            app,
+            op_index,
+            &HandleDerivationContext {
+                program_id: crate::ID,
+                chain_id: 13,
+                previous_bank_hash: slot_entropy,
+                unix_timestamp: 42,
+            },
+        )
+    };
+    let base = seed(5, app, 0, [9; 32]);
+
+    // Two executions in one slot consume different nonces, whatever else they share.
+    assert_ne!(base, seed(6, app, 0, [9; 32]));
+    // The application identity is bound in.
+    let other_app = AppScope {
+        program: Pubkey::new_unique(),
+        ..app
+    };
+    assert_ne!(base, seed(5, other_app, 0, [9; 32]));
+    assert_ne!(
+        base,
+        seed(
+            5,
+            AppScope {
+                scope: Pubkey::new_unique(),
+                ..app
+            },
+            0,
+            [9; 32]
+        )
+    );
+    // Two rand steps in one execution differ by op_index.
+    assert_ne!(base, seed(5, app, 1, [9; 32]));
+    // Cross-slot: slot entropy differs.
+    assert_ne!(base, seed(5, app, 0, [10; 32]));
+    // Determinism: identical inputs reproduce the seed (DD-033 replay).
+    assert_eq!(base, seed(5, app, 0, [9; 32]));
+}
+
+/// Builds a handle carrying `fhe_type` in byte 30 (the canonical type nibble read by
+/// `handle_fhe_type`); the remaining bytes only need to differ per operand.
+fn typed_handle(tag: u8, fhe_type: u8) -> [u8; 32] {
+    let mut handle = [tag; 32];
+    handle[30] = fhe_type;
+    handle
+}
+
+/// A big-endian plaintext scalar.
+fn be_u128(value: u128) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[16..].copy_from_slice(&value.to_be_bytes());
+    bytes
+}
+
+/// Asserts the operand-validation result failed with the given Anchor error code.
+fn assert_error(result: Result<()>, expected: ZamaHostError) {
+    let code = match result.unwrap_err() {
+        anchor_lang::error::Error::AnchorError(err) => err.error_code_number,
+        other => panic!("expected an AnchorError, got {other:?}"),
+    };
+    assert_eq!(code, u32::from(expected));
+}
+
+#[test]
+fn assert_sum_operand_types_enforces_uniform_declared_type() {
+    let a = typed_handle(1, 5);
+    let b = typed_handle(2, 5);
+    assert!(assert_sum_operand_types(&[a, b], 5).is_ok());
+    // A single operand whose type differs from the declared type is rejected — the type-confusion
+    // gap this branch closes for Sum.
+    assert_error(
+        assert_sum_operand_types(&[a, typed_handle(3, 4)], 5),
+        ZamaHostError::BinaryOperandTypeMismatch,
+    );
+    // EVM/coprocessor enforce no minimum: single-operand and empty sums are valid.
+    assert!(assert_sum_operand_types(&[a], 5).is_ok());
+    assert!(assert_sum_operand_types(&[], 5).is_ok());
+    // Non-uint declared types are still rejected.
+    assert_error(
+        assert_sum_operand_types(&[typed_handle(1, 0), typed_handle(2, 0)], 0),
+        ZamaHostError::UnsupportedFheType,
+    );
+}
+
+#[test]
+fn assert_is_in_operand_types_enforces_uniform_declared_type() {
+    let value = typed_handle(1, 4);
+    let set = [typed_handle(2, 4), typed_handle(3, 4)];
+    assert!(assert_is_in_operand_types(value, &set, 4).is_ok());
+    // Solana host max is euint128: Uint256 (type 8) is rejected at the type gate.
+    assert_error(
+        assert_is_in_operand_types(
+            typed_handle(1, 8),
+            &[typed_handle(2, 8), typed_handle(3, 8)],
+            8,
+        ),
+        ZamaHostError::UnsupportedFheType,
+    );
+    assert_error(
+        assert_is_in_operand_types(typed_handle(1, 7), &[typed_handle(2, 7)], 7),
+        ZamaHostError::UnsupportedFheType,
+    );
+    // Value type mismatch and set-element type mismatch are both rejected.
+    assert_error(
+        assert_is_in_operand_types(typed_handle(1, 5), &set, 4),
+        ZamaHostError::BinaryOperandTypeMismatch,
+    );
+    assert_error(
+        assert_is_in_operand_types(value, &[typed_handle(2, 4), typed_handle(3, 5)], 4),
+        ZamaHostError::BinaryOperandTypeMismatch,
+    );
+    // EVM/coprocessor enforce no minimum: an empty set is valid (membership is trivially false).
+    assert!(assert_is_in_operand_types(value, &[], 4).is_ok());
+    // The excluded ebool type is still rejected.
+    assert_error(
+        assert_is_in_operand_types(typed_handle(1, 0), &[typed_handle(2, 0)], 0),
+        ZamaHostError::UnsupportedFheType,
+    );
+}
+
+#[test]
+fn assert_mul_div_operand_types_matches_evm_bounds() {
+    let factor1 = typed_handle(1, 5);
+    let factor2 = typed_handle(2, 5);
+    let nonzero_divisor = be_u128(9);
+    // Encrypted factor2 of the same type, and a scalar factor2 (handle ignored), are both accepted.
+    assert!(assert_mul_div_operand_types(factor1, factor2, false, nonzero_divisor, 5).is_ok());
+    assert!(assert_mul_div_operand_types(factor1, be_u128(2), true, nonzero_divisor, 5).is_ok());
+    // Uint128 output is rejected — EVM and the coprocessor cap mulDiv at Uint64.
+    assert_error(
+        assert_mul_div_operand_types(
+            typed_handle(1, 6),
+            typed_handle(2, 6),
+            false,
+            nonzero_divisor,
+            6,
+        ),
+        ZamaHostError::UnsupportedFheType,
+    );
+    // factor1 / encrypted-factor2 type mismatches are rejected.
+    assert_error(
+        assert_mul_div_operand_types(typed_handle(1, 4), factor2, false, nonzero_divisor, 5),
+        ZamaHostError::BinaryOperandTypeMismatch,
+    );
+    assert_error(
+        assert_mul_div_operand_types(factor1, typed_handle(2, 4), false, nonzero_divisor, 5),
+        ZamaHostError::BinaryOperandTypeMismatch,
+    );
+    // A zero plaintext divisor is rejected (EVM DivisionByZero parity).
+    assert_error(
+        assert_mul_div_operand_types(factor1, be_u128(2), true, [0u8; 32], 5),
+        ZamaHostError::MulDivDivisorZero,
+    );
+}
+
+#[test]
+fn assert_unary_operand_type_rejects_same_type_cast() {
+    // Cast to a different type is allowed; a same-type cast is rejected (EVM InvalidType parity).
+    assert!(assert_unary_operand_type(FheUnaryOpCode::Cast, typed_handle(1, 5), 4).is_ok());
+    assert_error(
+        assert_unary_operand_type(FheUnaryOpCode::Cast, typed_handle(1, 5), 5),
+        ZamaHostError::UnsupportedFheType,
+    );
+    // Cast type sets: bool input casts (bool -> Uint32) are allowed. Uint256 is outside
+    // the Solana host type gate (max is euint128).
+    assert!(assert_unary_operand_type(FheUnaryOpCode::Cast, typed_handle(1, 0), 4).is_ok());
+    assert_error(
+        assert_unary_operand_type(FheUnaryOpCode::Cast, typed_handle(1, 8), 5),
+        ZamaHostError::UnsupportedFheType,
+    );
+    // ...but casting TO ebool (0) or eaddress/Uint160 (7), or FROM eaddress (7), is rejected.
+    assert_error(
+        assert_unary_operand_type(FheUnaryOpCode::Cast, typed_handle(1, 5), 0),
+        ZamaHostError::UnsupportedFheType,
+    );
+    assert_error(
+        assert_unary_operand_type(FheUnaryOpCode::Cast, typed_handle(1, 5), 7),
+        ZamaHostError::UnsupportedFheType,
+    );
+    assert_error(
+        assert_unary_operand_type(FheUnaryOpCode::Cast, typed_handle(1, 7), 5),
+        ZamaHostError::UnsupportedFheType,
+    );
+    // Neg/Not require operand type == output type; Not additionally accepts ebool, Neg does not.
+    assert!(assert_unary_operand_type(FheUnaryOpCode::Neg, typed_handle(1, 5), 5).is_ok());
+    assert!(assert_unary_operand_type(FheUnaryOpCode::Not, typed_handle(1, 0), 0).is_ok());
+    assert_error(
+        assert_unary_operand_type(FheUnaryOpCode::Neg, typed_handle(1, 0), 0),
+        ZamaHostError::UnsupportedFheType,
+    );
+}
+
+#[test]
+fn assert_binary_operand_types_matches_evm_supported_sets() {
+    // Eq/Ne accept Bool and Uint8..Uint128; their output is ebool. Uint256 is rejected.
+    assert!(assert_binary_operand_types(
+        FheBinaryOpCode::Eq,
+        typed_handle(1, 0),
+        typed_handle(2, 0),
+        false,
+        0
+    )
+    .is_ok());
+    assert_error(
+        assert_binary_operand_types(
+            FheBinaryOpCode::Ne,
+            typed_handle(1, 8),
+            typed_handle(2, 8),
+            false,
+            0,
+        ),
+        ZamaHostError::UnsupportedFheType,
+    );
+    // Ordered comparisons reject Bool (EVM fheGe supportedTypes = Uint8..Uint128).
+    assert_error(
+        assert_binary_operand_types(
+            FheBinaryOpCode::Ge,
+            typed_handle(1, 0),
+            typed_handle(2, 0),
+            false,
+            0,
+        ),
+        ZamaHostError::UnsupportedFheType,
+    );
+    // Bitwise ops reject Uint256; Solana host max is euint128.
+    assert_error(
+        assert_binary_operand_types(
+            FheBinaryOpCode::And,
+            typed_handle(1, 8),
+            typed_handle(2, 8),
+            false,
+            8,
+        ),
+        ZamaHostError::UnsupportedFheType,
+    );
+    assert_error(
+        assert_binary_operand_types(
+            FheBinaryOpCode::And,
+            typed_handle(1, 8),
+            typed_handle(2, 5),
+            false,
+            8,
+        ),
+        ZamaHostError::UnsupportedFheType,
+    );
+}
+
+#[test]
+fn assert_binary_div_rem_require_nonzero_scalar_divisor() {
+    let lhs = typed_handle(1, 5); // euint64
+    let nonzero_scalar = be_u128(9);
+    // A non-zero scalar divisor is accepted for both Div and Rem.
+    assert!(
+        assert_binary_operand_types(FheBinaryOpCode::Div, lhs, nonzero_scalar, true, 5).is_ok()
+    );
+    assert!(
+        assert_binary_operand_types(FheBinaryOpCode::Rem, lhs, nonzero_scalar, true, 5).is_ok()
+    );
+    // An encrypted divisor is rejected — division is scalar-only (EVM `IsNotScalar`).
+    assert_error(
+        assert_binary_operand_types(FheBinaryOpCode::Div, lhs, typed_handle(2, 5), false, 5),
+        ZamaHostError::DivisorMustBeScalar,
+    );
+    // A zero scalar divisor is rejected.
+    assert_error(
+        assert_binary_operand_types(FheBinaryOpCode::Rem, lhs, [0u8; 32], true, 5),
+        ZamaHostError::DivisionByZero,
+    );
+    // 0x0100 on euint8 is out of range, not a truncated zero (EVM `ScalarOutOfRange`).
+    assert_error(
+        assert_binary_operand_types(
+            FheBinaryOpCode::Div,
+            typed_handle(1, 2),
+            be_u128(0x100),
+            true,
+            2,
+        ),
+        ZamaHostError::ScalarOutOfRange,
+    );
+}
+
+#[test]
+fn assert_binary_rejects_scalars_above_the_operand_type() {
+    let euint8 = typed_handle(1, 2);
+    assert!(
+        assert_binary_operand_types(FheBinaryOpCode::Add, euint8, be_u128(0xff), true, 2).is_ok()
+    );
+    assert_error(
+        assert_binary_operand_types(FheBinaryOpCode::Add, euint8, be_u128(0x101), true, 2),
+        ZamaHostError::ScalarOutOfRange,
+    );
+    // A comparison checks the scalar against its operand type, not its ebool result.
+    assert!(
+        assert_binary_operand_types(FheBinaryOpCode::Lt, euint8, be_u128(0xff), true, 0).is_ok()
+    );
+    assert_error(
+        assert_binary_operand_types(FheBinaryOpCode::Lt, euint8, be_u128(0x100), true, 0),
+        ZamaHostError::ScalarOutOfRange,
+    );
+}
+
+#[test]
+fn scalar_range_follows_each_fhe_type_maximum() {
+    for (fhe_type, max) in [
+        (0, 1),
+        (2, u128::from(u8::MAX)),
+        (3, u128::from(u16::MAX)),
+        (4, u128::from(u32::MAX)),
+        (5, u128::from(u64::MAX)),
+    ] {
+        assert!(
+            assert_scalar_in_range(be_u128(max), fhe_type).is_ok(),
+            "type {fhe_type} max"
+        );
+        assert!(
+            assert_scalar_in_range(be_u128(max + 1), fhe_type).is_err(),
+            "type {fhe_type} max + 1"
+        );
+    }
+    assert!(assert_scalar_in_range(be_u128(u128::MAX), 6).is_ok());
+    let mut above_u128 = [0u8; 32];
+    above_u128[15] = 1;
+    assert!(assert_scalar_in_range(above_u128, 6).is_err());
+    assert_error(
+        assert_scalar_in_range(be_u128(0), 1),
+        ZamaHostError::UnsupportedFheType,
+    );
+}
+
+#[test]
+fn assert_mul_div_rejects_out_of_range_scalars() {
+    let factor1 = typed_handle(1, 2); // euint8
+    let factor2 = typed_handle(2, 2);
+    // 0x0100 on euint8 is out of range for the divisor and for a scalar factor2 (EVM parity).
+    assert_error(
+        assert_mul_div_operand_types(factor1, factor2, false, be_u128(0x100), 2),
+        ZamaHostError::ScalarOutOfRange,
+    );
+    assert_error(
+        assert_mul_div_operand_types(factor1, be_u128(0x100), true, be_u128(1), 2),
+        ZamaHostError::ScalarOutOfRange,
+    );
+    assert!(assert_mul_div_operand_types(factor1, be_u128(0xff), true, be_u128(0xff), 2).is_ok());
+}
+
+#[test]
+fn assert_sum_and_is_in_enforce_coprocessor_max_operand_counts() {
+    // Narrow types (Uint8..Uint32) cap at 100 operands; wider ones at 60.
+    let narrow = |n| vec![typed_handle(1, 2); n];
+    assert!(assert_sum_operand_types(&narrow(100), 2).is_ok());
+    assert_error(
+        assert_sum_operand_types(&narrow(101), 2),
+        ZamaHostError::InvalidFheExecuteAccount,
+    );
+    let wide = |n| vec![typed_handle(1, 5); n];
+    assert!(assert_sum_operand_types(&wide(60), 5).is_ok());
+    assert_error(
+        assert_sum_operand_types(&wide(61), 5),
+        ZamaHostError::InvalidFheExecuteAccount,
+    );
+    // IsIn caps the set size (excluding the tested value) the same way.
+    let value = typed_handle(1, 2);
+    assert!(assert_is_in_operand_types(value, &narrow(100), 2).is_ok());
+    assert_error(
+        assert_is_in_operand_types(value, &narrow(101), 2),
+        ZamaHostError::InvalidFheExecuteAccount,
+    );
+}
+
+#[test]
+fn handle_derivation_binds_the_program_id() {
+    let context = |program_id: Pubkey| HandleDerivationContext {
+        program_id,
+        chain_id: 13,
+        previous_bank_hash: [9; 32],
+        unix_timestamp: 42,
+    };
+    let other = Pubkey::new_unique();
+    let trivial = |program_id| computed_eval_trivial_handle([7; 32], 5, &context(program_id));
+    let rand = |program_id| computed_rand_handle([1; 16], 5, program_id, 13);
+    let rand_bounded =
+        |program_id| computed_rand_bounded_handle([10; 32], [1; 16], 5, program_id, 13);
+    // Two deployments never share a handle for the same inputs (trivial encrypt and both rand regimes).
+    assert_ne!(trivial(crate::ID), trivial(other));
+    assert_ne!(rand(crate::ID), rand(other));
+    assert_ne!(rand_bounded(crate::ID), rand_bounded(other));
+}

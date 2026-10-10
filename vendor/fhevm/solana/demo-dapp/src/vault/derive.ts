@@ -1,0 +1,182 @@
+import { tokenStoreAddress } from './internal/encryptedStores.js';
+import { findEventAuthorityPda as findZamaEventAuthorityPda, findHostConfigPda } from '@fhevm/solana-zama-host';
+import { findAssociatedTokenPda, TOKEN_PROGRAM_ADDRESS } from '@solana-program/token';
+import type { Address } from '@solana/kit';
+import {
+  findVaultAuthorityPda as findDemoVaultAuthorityPda,
+  findVaultTokenAccountPda,
+} from './internal/generated/demoVault/pdas/index.js';
+import {
+  findBatchPda,
+  findBatchAuthorityPda,
+  findBatchJoinUnderlyingPda,
+  findBatchPayoutUnderlyingPda,
+} from './internal/generated/confidentialBatcher/pdas/index.js';
+import {
+  findPendingBurnPda,
+  findTokenAccountPda,
+  findTotalSupplyAuthorityPda,
+  findVaultAuthorityPda as findMintVaultAuthorityPda,
+  findEventAuthorityPda as findTokenEventAuthorityPda,
+} from '@fhevm/confidential-token';
+
+/**
+ * The immutable roots of one batcher's demo topology — the addresses a real integrator (or the
+ * demo-config JSON) knows up front. Everything batch-scoped is DERIVED from these plus a batch
+ * index; nothing here is fetched. `join*`/`payout*` name the two directions' mints: a Deposit
+ * batcher joins cUSDC and pays out cShares, a Redeem batcher the reverse.
+ */
+export interface VaultDemoRoots {
+  readonly batcherProgram: Address;
+  readonly tokenProgram: Address;
+  readonly vaultProgram: Address;
+  readonly hostProgram: Address;
+  readonly batcher: Address;
+  readonly vault: Address;
+  /** Confidential mint the batch total is burned on (join phase). */
+  readonly joinConfidentialMint: Address;
+  /** Confidential mint claims pay out in (payout phase). */
+  readonly payoutConfidentialMint: Address;
+  /** SPL mint `joinConfidentialMint` wraps. */
+  readonly joinUnderlyingMint: Address;
+  /** SPL mint `payoutConfidentialMint` wraps. */
+  readonly payoutUnderlyingMint: Address;
+}
+
+/** Every batch-scoped address derivable from the roots and a batch index — no chain reads. */
+export interface BatchAddresses {
+  /** The batch account PDA (seeds on the batcher's index). */
+  readonly batch: Address;
+  /** The per-batch signing authority (redemption recipient, vault actor, wrap owner). */
+  readonly batchAuthority: Address;
+  /** The batch authority's confidential token account on the join mint. */
+  readonly batchJoinTokenAccount: Address;
+  /** The batch authority's confidential token account on the payout mint. */
+  readonly batchPayoutTokenAccount: Address;
+  /** Plain SPL account receiving the redeemed batch total (join underlying). */
+  readonly batchJoinUnderlying: Address;
+  /** Plain SPL account receiving the vault phase's output (payout underlying). */
+  readonly batchPayoutUnderlying: Address;
+  /** The batch's burned-amount encrypted store on the join mint, which settle passes to redeem. */
+  readonly batchBurnedAmountStore: Address;
+  /** The batch payout token account's confidential balance encrypted store. */
+  readonly batchPayoutBalanceStore: Address;
+}
+
+/**
+ * Derives every batch-scoped address for a batcher and zero-based batch index. Pure: it seeds PDAs
+ * and hashes labels, never touching the RPC. The join-side underlying accounts, the payout-side
+ * confidential accounts, and both plain SPL underlyings all fall out of the batch account and the
+ * roots' mints — the same derivations the on-chain `settle` handler resolves as `#[account(seeds)]`.
+ */
+export async function deriveBatchAddresses(roots: VaultDemoRoots, batchIndex: bigint): Promise<BatchAddresses> {
+  const batch = (await findBatchPda({ batcher: roots.batcher, index: batchIndex }))[0];
+  const [batchAuthority] = await findBatchAuthorityPda({ batch });
+  const batchJoinTokenAccount = (await findTokenAccountPda({ mint: roots.joinConfidentialMint, owner: batchAuthority }))[0];
+  const batchPayoutTokenAccount = (await findTokenAccountPda({ mint: roots.payoutConfidentialMint, owner: batchAuthority }))[0];
+  const [batchJoinUnderlying] = await findBatchJoinUnderlyingPda({ batch });
+  const [batchPayoutUnderlying] = await findBatchPayoutUnderlyingPda({ batch });
+  return {
+    batch,
+    batchAuthority,
+    batchJoinTokenAccount,
+    batchPayoutTokenAccount,
+    batchJoinUnderlying,
+    batchPayoutUnderlying,
+    // Burned amount: the join mint's `burned_amount` value of the batch's join token account.
+    // Payout balance: the payout mint's `balance` value of the batch's payout token account.
+    batchBurnedAmountStore: await tokenStoreAddress(roots.joinConfidentialMint, batchJoinTokenAccount),
+    batchPayoutBalanceStore: await tokenStoreAddress(roots.payoutConfidentialMint, batchPayoutTokenAccount),
+  };
+}
+
+/**
+ * The complete account set for one `settle`, derived from the roots and a batch's addresses. This is
+ * the settle instruction's non-fixed, batch-scoped accounts and event authorities.
+ * The payer and transaction transient store are resolved when the transaction is assembled. `pendingBurn`
+ * is derived from the join mint and batch join token account, so it is known at `open_batch`.
+ */
+export interface SolanaVaultSettleAccounts {
+  readonly batcher: Address;
+  readonly batch: Address;
+  readonly joinConfidentialMint: Address;
+  readonly batchJoinTokenAccount: Address;
+  readonly joinUnderlyingMint: Address;
+  readonly joinMintVaultUnderlying: Address;
+  readonly joinMintVaultAuthority: Address;
+  readonly batchBurnedAmountStore: Address;
+  /** The batch join token account's single pending burn, known before dispatch. */
+  readonly pendingBurn: Address;
+  readonly hostConfig: Address;
+  readonly vault: Address;
+  readonly vaultAuthority: Address;
+  readonly vaultTokenAccount: Address;
+  readonly payoutConfidentialMint: Address;
+  readonly payoutUnderlyingMint: Address;
+  readonly batchPayoutTokenAccount: Address;
+  readonly payoutMintVaultUnderlying: Address;
+  readonly payoutMintVaultAuthority: Address;
+  readonly payoutTotalSupplyAuthority: Address;
+  readonly batchPayoutBalanceStore: Address;
+  readonly payoutTotalSupplyStore: Address;
+  readonly joinTotalSupplyAuthority: Address;
+  readonly joinTotalSupplyStore: Address;
+  readonly batchAuthority: Address;
+  readonly batchJoinUnderlying: Address;
+  readonly batchPayoutUnderlying: Address;
+  readonly zamaEventAuthority: Address;
+  readonly confidentialTokenEventAuthority: Address;
+}
+
+export async function deriveSettleAccounts(
+  roots: VaultDemoRoots,
+  batch: BatchAddresses,
+): Promise<SolanaVaultSettleAccounts> {
+  const [joinMintVaultAuthority] = await findMintVaultAuthorityPda({ mint: roots.joinConfidentialMint });
+  const [payoutMintVaultAuthority] = await findMintVaultAuthorityPda({ mint: roots.payoutConfidentialMint });
+  const [payoutTotalSupplyAuthority] = await findTotalSupplyAuthorityPda({ mint: roots.payoutConfidentialMint });
+  const [joinTotalSupplyAuthority] = await findTotalSupplyAuthorityPda({ mint: roots.joinConfidentialMint });
+  const [vaultAuthority] = await findDemoVaultAuthorityPda({ vault: roots.vault });
+  const [vaultTokenAccount] = await findVaultTokenAccountPda({ vault: roots.vault });
+  return {
+    batchAuthority: batch.batchAuthority,
+    batchJoinUnderlying: batch.batchJoinUnderlying,
+    batchPayoutUnderlying: batch.batchPayoutUnderlying,
+    zamaEventAuthority: (await findZamaEventAuthorityPda())[0],
+    confidentialTokenEventAuthority: (await findTokenEventAuthorityPda())[0],
+    batcher: roots.batcher,
+    batch: batch.batch,
+    joinConfidentialMint: roots.joinConfidentialMint,
+    batchJoinTokenAccount: batch.batchJoinTokenAccount,
+    joinUnderlyingMint: roots.joinUnderlyingMint,
+    joinMintVaultUnderlying: (await findAssociatedTokenPda({
+      owner: joinMintVaultAuthority,
+      tokenProgram: TOKEN_PROGRAM_ADDRESS,
+      mint: roots.joinUnderlyingMint,
+    }))[0],
+    joinMintVaultAuthority,
+    batchBurnedAmountStore: batch.batchBurnedAmountStore,
+    pendingBurn: (await findPendingBurnPda({ mint: roots.joinConfidentialMint, tokenAccount: batch.batchJoinTokenAccount }))[0],
+    hostConfig: (await findHostConfigPda())[0],
+    vault: roots.vault,
+    vaultAuthority,
+    vaultTokenAccount,
+    payoutConfidentialMint: roots.payoutConfidentialMint,
+    payoutUnderlyingMint: roots.payoutUnderlyingMint,
+    batchPayoutTokenAccount: batch.batchPayoutTokenAccount,
+    payoutMintVaultUnderlying: (await findAssociatedTokenPda({
+      owner: payoutMintVaultAuthority,
+      tokenProgram: TOKEN_PROGRAM_ADDRESS,
+      mint: roots.payoutUnderlyingMint,
+    }))[0],
+    payoutMintVaultAuthority,
+    payoutTotalSupplyAuthority,
+    batchPayoutBalanceStore: batch.batchPayoutBalanceStore,
+    // Total supply: domain = payout mint, encrypted store authority = its total-supply
+    // authority, encrypted value label =
+    // `total_supply`.
+    payoutTotalSupplyStore: await tokenStoreAddress(roots.payoutConfidentialMint, payoutTotalSupplyAuthority),
+    joinTotalSupplyAuthority,
+    joinTotalSupplyStore: await tokenStoreAddress(roots.joinConfidentialMint, joinTotalSupplyAuthority),
+  };
+}

@@ -1,0 +1,57 @@
+//! Internal operand representation shared by the builder, validators, and lowering.
+
+use std::marker::PhantomData;
+
+/// Makes a builder's `'id` lifetime invariant, so no two builders' identities are subtypes of one
+/// another and a value cannot be coerced from one builder into the next. Zero-sized: the identity
+/// exists only in the type checker, which is the point — the runtime tag it replaced was a
+/// compile-time constant on SBF, so on-chain it never caught anything.
+pub(crate) type BuilderIdentity<'id> = PhantomData<fn(&'id ()) -> &'id ()>;
+
+/// Raw operand used by the lowering implementation.
+///
+/// Public builders expose typed [`Encrypted`] values instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Operand(pub(crate) OperandKind);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OperandKind {
+    StoreSlot {
+        store: crate::StoreId,
+        key: [u8; 32],
+        handle: [u8; 32],
+    },
+    Granted {
+        consumer: crate::StoreId,
+        handle: [u8; 32],
+    },
+    Transient {
+        producer_index: u8,
+    },
+    /// External input verified in-execution via a coprocessor attestation (EVM `fromExternal`). The
+    /// `Vec`-bearing attestation is held by the [`FheExecutionBuilder`] and referenced by index; keeping
+    /// only the index + `input_handle` here leaves the operand `Copy`. `input_handle` carries the
+    /// FHE type for operand type-checks without touching the attestation.
+    VerifiedInput {
+        input_handle: [u8; 32],
+        attestation_index: u8,
+    },
+    Scalar([u8; 32]),
+}
+
+impl Operand {
+    pub(crate) fn transient(producer_index: u8) -> Self {
+        Self(OperandKind::Transient { producer_index })
+    }
+
+    pub(crate) fn scalar(value: [u8; 32]) -> Self {
+        Self(OperandKind::Scalar(value))
+    }
+
+    pub(crate) fn verified_input(input_handle: [u8; 32], attestation_index: u8) -> Self {
+        Self(OperandKind::VerifiedInput {
+            input_handle,
+            attestation_index,
+        })
+    }
+}

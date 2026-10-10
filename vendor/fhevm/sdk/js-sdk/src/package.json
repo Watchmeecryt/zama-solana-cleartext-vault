@@ -1,0 +1,111 @@
+{
+  "name": "@fhevm/sdk",
+  "description": "TypeScript Interface for FHEVM",
+  "version": "0.15.0-0",
+  "type": "module",
+  "main": "./index.ts",
+  "module": "./index.ts",
+  "types": "./index.ts",
+  "sideEffects": false,
+  "files": [
+    "*",
+    "!**/*.test.ts",
+    "!**/*.template",
+    "!**/*.tsbuildinfo",
+    "!vitest.config.ts",
+    "!tsconfig.json",
+    "!wasm/tfhe/v*/**",
+    "!wasm/tkms/v*/**"
+  ],
+  "typesVersions": {
+    "*": {
+      "base": [
+        "./_types/core/base/index.d.ts"
+      ],
+      "chains": [
+        "./_types/core/chains/index.d.ts"
+      ],
+      "types": [
+        "./_types/core/types/index.d.ts"
+      ],
+      "actions/base": [
+        "./_types/core/actions/base/index.d.ts"
+      ],
+      "actions/chain": [
+        "./_types/core/actions/chain/index.d.ts"
+      ],
+      "actions/decrypt": [
+        "./_types/core/actions/decrypt/index.d.ts"
+      ],
+      "actions/encrypt": [
+        "./_types/core/actions/encrypt/index.d.ts"
+      ],
+      "actions/host": [
+        "./_types/core/actions/host/index.d.ts"
+      ]
+    }
+  },
+  "exports": {
+    ".": "./index.ts",
+    "./base": "./core/base/index.ts",
+    "./chains": "./core/chains/index.ts",
+    "./types": "./core/types/index.ts",
+    "./solana": "./solana/index.ts",
+    "./solana/cleartext": "./solana/cleartext/index.ts",
+    "./package.json": "./package.json"
+  },
+  "peerDependencies": {
+    "@fhevm/solana-zama-host": "^0.15.0-0",
+    "@solana/kit": "^8.4.0",
+    "@solana/sysvars": "^8.4.0",
+    "@solana/wallet-standard-features": "^1.4.0",
+    "@wallet-standard/base": "^1.1.1",
+    "ethers": ">=6.8.0",
+    "typescript": ">=5.0.4",
+    "viem": ">=2"
+  },
+  "peerDependenciesMeta": {
+    "@fhevm/solana-zama-host": {
+      "optional": true
+    },
+    "@solana/kit": {
+      "optional": true
+    },
+    "@solana/sysvars": {
+      "optional": true
+    },
+    "@solana/wallet-standard-features": {
+      "optional": true
+    },
+    "@wallet-standard/base": {
+      "optional": true
+    },
+    "ethers": {
+      "optional": true
+    },
+    "typescript": {
+      "optional": true
+    },
+    "viem": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@noble/curves": "2.0.1",
+    "@noble/hashes": "2.0.1",
+    "wasm-feature-detect": "1.8.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zama-ai/fhevm.git"
+  },
+  "author": "",
+  "license": "BSD-3-Clause-Clear",
+  "homepage": "https://github.com/zama-ai/fhevm/sdk/#readme",
+  "bugs": {
+    "url": "https://github.com/zama-ai/fhevm/sdk/js/issues"
+  },
+  "engines": {
+    "node": ">=22.0"
+  }
+}

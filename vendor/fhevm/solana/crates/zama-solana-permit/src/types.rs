@@ -1,0 +1,348 @@
+//! Typed permit fields, their transport form, and the fixed protocol sizes.
+//!
+//! `PermitFields` is the validated type: it has no public constructor and no
+//! public mutation, so the only way to obtain one is strict decoding of
+//! `PermitWireFields` (see [`crate::validate`]). Everything downstream — the
+//! canonical text, the envelope, verification — takes the validated type, which is
+//! why "render a permit that was never validated" is not expressible.
+//!
+//! Public API surface: wallets and relayers. The transport conversions exist for the clients that
+//! carry a permit over the wire, which is why some have no caller inside this repository.
+
+use crate::error::PermitError;
+
+/// Every permit identity is exactly this many bytes.
+pub const IDENTITY_LEN: usize = 32;
+/// The single accepted transport-key length: the tfhe safe-serialized
+/// `UnifiedPublicEncKey::MlKem512` container — 800 bytes of encapsulation key inside
+/// 69 bytes of serialization header. One representation travels the whole chain: it is
+/// what the SDK's `ml_kem_pke_pk_to_u8vec` produces, what the wallet's signed text
+/// fingerprints, and what the KMS links verbatim, so the signed and the linked object
+/// can never diverge. The permit carries no variant or representation field, so this
+/// length declares both — the bare 800-byte encapsulation key (the representation this
+/// permit once accepted) and the larger ML-KEM-1024 variant in either shape are all
+/// rejected by width alone. The constant depends on tfhe's serialization header (type
+/// name + versions); a header change shifts it, and the shared normative vectors are
+/// the detector for that drift. A planned KMS migration toward carrying a 32-byte key
+/// digest in permits and linkers (full key only for the encryption itself) would
+/// change this length again — it is a wire representation, not protocol essence.
+pub const TRANSPORT_KEY_LEN: usize = 869;
+/// A scope entry is exactly this many bytes: the program identity then the scope
+/// identity, with no separator.
+pub const SCOPE_LEN: usize = 2 * IDENTITY_LEN;
+/// Upper bound on the signed scope list. The empty list is also valid and means
+/// permissive. Seven, not ten: a scope line carries two identities, and the widest
+/// admissible permit has to clear-sign inside the 1232-byte wallet ceiling with margin
+/// (see the size-budget suite).
+pub const MAX_ALLOWED_SCOPES: usize = 7;
+/// A permit must be valid for at least one second.
+pub const MIN_DURATION_SECONDS: u64 = 1;
+/// A permit must not be valid for more than 365 days.
+pub const MAX_DURATION_SECONDS: u64 = 31_536_000;
+/// Latest representable start, `9999-12-31T23:59:59Z`. Keeping the start below this
+/// bound is what makes the timestamp rendering total, and what precludes a u64
+/// overflow when the authorization layer adds the duration.
+pub const MAX_START_TIMESTAMP: u64 = 253_402_300_799;
+/// The only known version byte of the signed KMS routing field.
+pub const KMS_ROUTING_VERSION_BYTE: u8 = 0x02;
+/// Exact length of the signed KMS routing field at its only known version:
+/// version byte plus two identities.
+pub const KMS_ROUTING_EXTRA_DATA_LEN: usize = 1 + IDENTITY_LEN + IDENTITY_LEN;
+/// Ed25519 signature length.
+pub const SIGNATURE_LEN: usize = 64;
+
+/// A 32-byte permit identity: a user, a program, a scope, a KMS context or a KMS
+/// epoch.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Identity([u8; IDENTITY_LEN]);
+
+impl Identity {
+    /// Wraps 32 bytes. Total by construction: the width rule is enforced where a
+    /// transport value of unknown width is decoded, not here.
+    pub fn new(bytes: [u8; IDENTITY_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// The underlying bytes.
+    pub fn as_bytes(&self) -> &[u8; IDENTITY_LEN] {
+        &self.0
+    }
+}
+
+/// A full transport key of the single accepted length.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TransportKey(Box<[u8; TRANSPORT_KEY_LEN]>);
+
+impl TransportKey {
+    /// Wraps a full-length transport key.
+    pub fn new(bytes: Box<[u8; TRANSPORT_KEY_LEN]>) -> Self {
+        Self(bytes)
+    }
+
+    /// The full key. Consumers that need to commit to the key commit to all of it;
+    /// the fingerprint is derived here, never accepted from outside.
+    pub fn as_bytes(&self) -> &[u8; TRANSPORT_KEY_LEN] {
+        &self.0
+    }
+}
+
+// A transport key is 869 bytes of serialized key material; printing it in a panic
+// message is noise, so the debug form is elided rather than derived.
+impl core::fmt::Debug for TransportKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("TransportKey(..)")
+    }
+}
+
+/// One application a permit is scoped to: the program that owns an encrypted value
+/// and the scope, an account of that program (the mint, for the token program). The
+/// pair is the application identity everywhere in the host: only the real program can
+/// produce the `program` half, and `scope` restores the per-application granularity a
+/// program id alone loses.
+///
+/// Ordering is byte order over `program ‖ scope`, which is the ordering the list rule
+/// is stated in.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct ApplicationScope([u8; SCOPE_LEN]);
+
+impl ApplicationScope {
+    /// Pairs a program with one of its scopes.
+    pub fn new(program: Identity, scope: Identity) -> Self {
+        let mut bytes = [0u8; SCOPE_LEN];
+        bytes[..IDENTITY_LEN].copy_from_slice(program.as_bytes());
+        bytes[IDENTITY_LEN..].copy_from_slice(scope.as_bytes());
+        Self(bytes)
+    }
+
+    /// Wraps the 64 transport bytes. Total by construction: the width rule is enforced
+    /// where a transport value of unknown width is decoded, not here.
+    pub fn from_bytes(bytes: [u8; SCOPE_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// The program half.
+    pub fn program(&self) -> Identity {
+        let mut out = [0u8; IDENTITY_LEN];
+        out.copy_from_slice(&self.0[..IDENTITY_LEN]);
+        Identity::new(out)
+    }
+
+    /// The scope half.
+    pub fn scope(&self) -> Identity {
+        let mut out = [0u8; IDENTITY_LEN];
+        out.copy_from_slice(&self.0[IDENTITY_LEN..]);
+        Identity::new(out)
+    }
+
+    /// The underlying bytes, `program ‖ scope`.
+    pub fn as_bytes(&self) -> &[u8; SCOPE_LEN] {
+        &self.0
+    }
+}
+
+/// The signed scope list, carrying its own validity: at most the maximum count,
+/// strictly ascending in byte order, no duplicates. Empty means permissive.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AllowedScopes(Vec<ApplicationScope>);
+
+impl AllowedScopes {
+    /// Checks the count, the strict byte-order ascent and the absence of
+    /// duplicates, and wraps the list. The only constructor.
+    pub fn new(scopes: Vec<ApplicationScope>) -> Result<Self, PermitError> {
+        if scopes.len() > MAX_ALLOWED_SCOPES {
+            return Err(PermitError::TooManyScopes {
+                count: scopes.len(),
+            });
+        }
+        // Strict ascent between neighbors is the whole rule: a list in which every entry
+        // exceeds its predecessor cannot repeat an entry anywhere, so there is nothing to
+        // check across a distance. Equality is reported as a duplicate rather than as a
+        // failed ascent, because that is the mistake a caller actually made.
+        for index in 1..scopes.len() {
+            if scopes[index] == scopes[index - 1] {
+                return Err(PermitError::DuplicateScope { index });
+            }
+            if scopes[index] < scopes[index - 1] {
+                return Err(PermitError::ScopesNotAscending { index });
+            }
+        }
+        Ok(Self(scopes))
+    }
+
+    /// The scopes, in signed order.
+    pub fn as_slice(&self) -> &[ApplicationScope] {
+        &self.0
+    }
+
+    /// True for a permissive permit.
+    pub fn is_permissive(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether `(program, scope)` is admitted: every pair under a permissive permit, and
+    /// exactly the signed pairs otherwise.
+    pub fn admits(&self, program: &Identity, scope: &Identity) -> bool {
+        self.is_permissive() || self.0.contains(&ApplicationScope::new(*program, *scope))
+    }
+}
+
+/// The signed KMS routing material, one variant per known version byte. New
+/// versions are added as variants; consumers match exhaustively, so a new version
+/// breaks the build instead of silently falling through.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum KmsRouting {
+    /// Version `0x02`: a KMS context id and a KMS epoch id.
+    ContextAndEpoch {
+        /// KMS context the permit is routed to.
+        kms_context_id: Identity,
+        /// KMS epoch (share generation) the permit is routed to.
+        kms_epoch_id: Identity,
+    },
+}
+
+impl KmsRouting {
+    /// Re-encodes the routing material back into its signed transport bytes.
+    ///
+    /// Exhaustive by construction: a new version has to be given its own encoding here,
+    /// because there is no fallback arm to absorb it.
+    pub fn to_extra_data(&self) -> Vec<u8> {
+        match self {
+            Self::ContextAndEpoch {
+                kms_context_id,
+                kms_epoch_id,
+            } => {
+                let mut out = Vec::with_capacity(KMS_ROUTING_EXTRA_DATA_LEN);
+                out.push(KMS_ROUTING_VERSION_BYTE);
+                out.extend_from_slice(kms_context_id.as_bytes());
+                out.extend_from_slice(kms_epoch_id.as_bytes());
+                out
+            }
+        }
+    }
+}
+
+/// The eight signed permit fields, validated.
+///
+/// No public constructor and no public setters: the only way in is
+/// [`PermitFields::decode`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PermitFields {
+    user_address: Identity,
+    transport_key: TransportKey,
+    allowed_scopes: AllowedScopes,
+    start_timestamp: u64,
+    duration_seconds: u64,
+    verifying_program_id: Identity,
+    chain_id: u64,
+    extra_data: KmsRouting,
+}
+
+impl PermitFields {
+    /// The signing wallet, also the sole envelope signer and the recipient.
+    pub fn user_address(&self) -> &Identity {
+        &self.user_address
+    }
+
+    /// The full transport key.
+    pub fn transport_key(&self) -> &TransportKey {
+        &self.transport_key
+    }
+
+    /// The signed `(program, scope)` list; empty means permissive.
+    pub fn allowed_scopes(&self) -> &AllowedScopes {
+        &self.allowed_scopes
+    }
+
+    /// Start of the validity window, unix seconds.
+    pub fn start_timestamp(&self) -> u64 {
+        self.start_timestamp
+    }
+
+    /// Length of the validity window, seconds.
+    pub fn duration_seconds(&self) -> u64 {
+        self.duration_seconds
+    }
+
+    /// Deployment: which program.
+    pub fn verifying_program_id(&self) -> &Identity {
+        &self.verifying_program_id
+    }
+
+    /// Deployment: which cluster.
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    /// Signed KMS routing material.
+    pub fn extra_data(&self) -> &KmsRouting {
+        &self.extra_data
+    }
+
+    /// Assembles validated fields. Crate-internal on purpose: the public way in is
+    /// strict decoding.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_validated(
+        user_address: Identity,
+        transport_key: TransportKey,
+        allowed_scopes: AllowedScopes,
+        start_timestamp: u64,
+        duration_seconds: u64,
+        verifying_program_id: Identity,
+        chain_id: u64,
+        extra_data: KmsRouting,
+    ) -> Self {
+        Self {
+            user_address,
+            transport_key,
+            allowed_scopes,
+            start_timestamp,
+            duration_seconds,
+            verifying_program_id,
+            chain_id,
+            extra_data,
+        }
+    }
+}
+
+/// The permit as it arrives over transport: widths and lengths are whatever the
+/// sender chose, which is exactly why they are checked here and not assumed.
+///
+/// This is the shape every wire format (relayer JSON, event payload, normative
+/// vectors) maps onto before decoding. Deliberately not `PermitFields`: the width
+/// rules are unrepresentable once the typed form is reached.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct PermitWireFields {
+    /// Claimed 32-byte user address.
+    pub user_address: Vec<u8>,
+    /// Claimed transport key of any length.
+    pub transport_key: Vec<u8>,
+    /// Claimed 64-byte `program ‖ scope` entries, in the sender's order.
+    pub allowed_scopes: Vec<Vec<u8>>,
+    /// Claimed validity-window start.
+    pub start_timestamp: u64,
+    /// Claimed validity-window length.
+    pub duration_seconds: u64,
+    /// Claimed 32-byte verifying program id.
+    pub verifying_program_id: Vec<u8>,
+    /// Claimed chain id.
+    pub chain_id: u64,
+    /// Claimed versioned KMS routing bytes.
+    pub extra_data: Vec<u8>,
+}
+
+/// An Ed25519 signature over the envelope.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Signature([u8; SIGNATURE_LEN]);
+
+impl Signature {
+    /// Wraps 64 signature bytes. Whether they verify is decided by verification,
+    /// not here.
+    pub fn new(bytes: [u8; SIGNATURE_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// The signature bytes.
+    pub fn as_bytes(&self) -> &[u8; SIGNATURE_LEN] {
+        &self.0
+    }
+}

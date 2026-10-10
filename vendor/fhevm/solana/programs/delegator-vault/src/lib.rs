@@ -1,0 +1,210 @@
+//! Test-only CPI probe, deployed nowhere. Its `vault` PDA stands in for a program-controlled
+//! delegator or pauser: it grants and revokes user-decryption delegations and pauses the host,
+//! signing each CPI with its seeds as a Squads vault does when a proposal executes. The host's
+//! `Signer` requirements are then met by a PDA of another program, not a wallet. It also
+//! forwards a nested transient store close and checks a callee's return data, for the Mollusk
+//! suites that need a calling program.
+
+// Anchor macros generate framework-shaped code that trips rustc/Clippy checks.
+#![allow(unexpected_cfgs)]
+
+use anchor_lang::{prelude::*, solana_program::instruction::Instruction};
+use zama_host::program::ZamaHost;
+
+declare_id!("ANFJWue3SKz6F7chTeeLfbZxqEwaGdhHb7muY6pkvFa3");
+
+/// Seed of the vault PDA that acts as the delegator.
+pub const VAULT_SEED: &[u8] = b"vault";
+
+/// The vault PDA an executor acts through.
+pub fn vault_address(executor: Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[VAULT_SEED, executor.as_ref()], &crate::ID)
+}
+
+#[program]
+pub mod delegator_vault {
+    use super::*;
+
+    /// Exercises the host's rejection of nested transient store closure. Test-only; deployed nowhere.
+    pub fn close_transient_store_via_cpi<'info>(
+        ctx: Context<'info, CloseTransientStoreViaCpi<'info>>,
+    ) -> Result<()> {
+        zama_host::cpi::close_transient_store(
+            CpiContext::new(
+                ctx.accounts.zama_host.key(),
+                zama_host::cpi::accounts::CloseTransientStore {
+                    instructions: ctx.accounts.instructions.to_account_info(),
+                    transient_store: ctx.accounts.transient_store.to_account_info(),
+                    payer: ctx.accounts.refund.to_account_info(),
+                },
+            )
+            .with_remaining_accounts(ctx.remaining_accounts.to_vec()),
+        )
+    }
+
+    /// Checks return data immediately after CPI, before the transaction's final
+    /// transient store close overwrites the runtime return channel.
+    pub fn check_cpi_return<'info>(
+        ctx: Context<'info, CheckCpiReturn<'info>>,
+        instruction_data: Vec<u8>,
+        expected: Vec<u8>,
+    ) -> Result<()> {
+        let instruction = Instruction {
+            program_id: ctx.accounts.callee.key(),
+            accounts: ctx
+                .remaining_accounts
+                .iter()
+                .map(|info| {
+                    if info.is_writable {
+                        AccountMeta::new(info.key(), info.is_signer)
+                    } else {
+                        AccountMeta::new_readonly(info.key(), info.is_signer)
+                    }
+                })
+                .collect(),
+            data: instruction_data,
+        };
+        anchor_lang::solana_program::program::invoke(&instruction, ctx.remaining_accounts)?;
+        match anchor_lang::solana_program::program::get_return_data() {
+            Some((program, returned)) => {
+                require_keys_eq!(program, ctx.accounts.callee.key());
+                require!(
+                    returned == expected,
+                    anchor_lang::error::ErrorCode::RequireEqViolated
+                );
+            }
+            None => require!(
+                expected.is_empty(),
+                anchor_lang::error::ErrorCode::RequireEqViolated
+            ),
+        }
+        Ok(())
+    }
+
+    /// Grants a user-decryption delegation with the executor's vault PDA as the delegator.
+    pub fn grant_via_vault(
+        ctx: Context<VaultDelegation>,
+        delegate: Pubkey,
+        program: Pubkey,
+        expires_at: u64,
+    ) -> Result<()> {
+        let executor = ctx.accounts.executor.key();
+        let bump = [ctx.bumps.vault];
+        let seeds: &[&[u8]] = &[VAULT_SEED, executor.as_ref(), &bump];
+        zama_host::cpi::delegate_for_user_decryption(
+            CpiContext::new_with_signer(
+                ctx.accounts.zama_host.key(),
+                zama_host::cpi::accounts::DelegateForUserDecryption {
+                    payer: ctx.accounts.executor.to_account_info(),
+                    delegator: ctx.accounts.vault.to_account_info(),
+                    host_config: ctx.accounts.host_config.to_account_info(),
+                    scope: ctx.accounts.scope.to_account_info(),
+                    delegation_record: ctx.accounts.delegation_record.to_account_info(),
+                    system_program: ctx.accounts.system_program.to_account_info(),
+                },
+                &[seeds],
+            ),
+            delegate,
+            program,
+            expires_at,
+        )
+    }
+
+    /// Revokes a delegation the executor's vault PDA granted.
+    pub fn revoke_via_vault(ctx: Context<VaultDelegation>) -> Result<()> {
+        let executor = ctx.accounts.executor.key();
+        let bump = [ctx.bumps.vault];
+        let seeds: &[&[u8]] = &[VAULT_SEED, executor.as_ref(), &bump];
+        zama_host::cpi::revoke_delegation_for_user_decryption(CpiContext::new_with_signer(
+            ctx.accounts.zama_host.key(),
+            zama_host::cpi::accounts::RevokeDelegationForUserDecryption {
+                delegator: ctx.accounts.vault.to_account_info(),
+                host_config: ctx.accounts.host_config.to_account_info(),
+                delegation_record: ctx.accounts.delegation_record.to_account_info(),
+            },
+            &[seeds],
+        ))
+    }
+
+    /// Sets host pause flags with the executor's vault PDA as the pauser.
+    pub fn pause_via_vault(ctx: Context<VaultPause>, areas: zama_host::PauseFlags) -> Result<()> {
+        let executor = ctx.accounts.executor.key();
+        let bump = [ctx.bumps.vault];
+        let seeds: &[&[u8]] = &[VAULT_SEED, executor.as_ref(), &bump];
+        zama_host::cpi::pause(
+            CpiContext::new_with_signer(
+                ctx.accounts.zama_host.key(),
+                zama_host::cpi::accounts::Pause {
+                    pauser: ctx.accounts.vault.to_account_info(),
+                    pauser_record: ctx.accounts.pauser_record.to_account_info(),
+                    host_config: ctx.accounts.host_config.to_account_info(),
+                    event_authority: ctx.accounts.event_authority.to_account_info(),
+                    program: ctx.accounts.zama_host.to_account_info(),
+                },
+                &[seeds],
+            ),
+            areas,
+        )
+    }
+}
+
+/// One account set serves both instructions; the revoke simply ignores the scope and the system
+/// program.
+#[derive(Accounts)]
+pub struct VaultDelegation<'info> {
+    /// Executes the "proposal" and pays rent on a grant.
+    #[account(mut)]
+    pub executor: Signer<'info>,
+    /// CHECK: the executor's own vault PDA, held to its seeds here; it signs the CPI, which is
+    /// the whole point — the host sees a delegator that is not a wallet.
+    #[account(seeds = [VAULT_SEED, executor.key().as_ref()], bump)]
+    pub vault: UncheckedAccount<'info>,
+    /// CHECK: validated by the host program against its own seeds.
+    pub host_config: UncheckedAccount<'info>,
+    /// CHECK: validated by the host program against the delegated program.
+    pub scope: UncheckedAccount<'info>,
+    /// CHECK: validated by the host program against the canonical delegation PDA.
+    #[account(mut)]
+    pub delegation_record: UncheckedAccount<'info>,
+    pub zama_host: Program<'info, ZamaHost>,
+    pub system_program: Program<'info, System>,
+}
+
+/// The vault pausing the host.
+#[derive(Accounts)]
+pub struct VaultPause<'info> {
+    pub executor: Signer<'info>,
+    /// CHECK: the executor's own vault PDA, held to its seeds here; it signs the CPI as the pauser.
+    #[account(seeds = [VAULT_SEED, executor.key().as_ref()], bump)]
+    pub vault: UncheckedAccount<'info>,
+    /// CHECK: validated by the host program against the vault's pauser PDA.
+    pub pauser_record: UncheckedAccount<'info>,
+    /// CHECK: validated by the host program against its own seeds.
+    #[account(mut)]
+    pub host_config: UncheckedAccount<'info>,
+    /// CHECK: validated by the host program's event CPI.
+    pub event_authority: UncheckedAccount<'info>,
+    pub zama_host: Program<'info, ZamaHost>,
+}
+
+/// Accounts forwarded to the host in the nested-close negative test.
+#[derive(Accounts)]
+pub struct CloseTransientStoreViaCpi<'info> {
+    /// CHECK: test forwards the transient store to ZamaHost.
+    #[account(mut)]
+    pub transient_store: UncheckedAccount<'info>,
+    /// CHECK: ZamaHost checks the recorded refund destination.
+    #[account(mut)]
+    pub refund: UncheckedAccount<'info>,
+    /// CHECK: validated by the host; this proxy deliberately adds no authorization.
+    pub instructions: UncheckedAccount<'info>,
+    pub zama_host: Program<'info, ZamaHost>,
+}
+
+/// The remaining accounts are the exact callee account list.
+#[derive(Accounts)]
+pub struct CheckCpiReturn<'info> {
+    /// CHECK: test probe intentionally invokes the supplied executable.
+    #[account(executable)]
+    pub callee: UncheckedAccount<'info>,
+}

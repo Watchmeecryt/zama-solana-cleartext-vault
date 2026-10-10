@@ -1,0 +1,16 @@
+[package]
+name = "zama-fhe"
+version = "0.1.0"
+description = "App-facing helpers for building ZamaHost Solana FHE execution requests"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+cpi = ["zama-host/cpi"]
+idl-build = ["anchor-lang/idl-build", "zama-host/idl-build"]
+
+[dependencies]
+anchor-lang = "1.2.0"
+zama-host = { path = "../../programs/zama-host", features = ["no-entrypoint"] }

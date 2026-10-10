@@ -1,0 +1,103 @@
+//! Program-specific errors returned by confidential-token instructions.
+
+use anchor_lang::prelude::*;
+
+/// Errors returned by the confidential token PoC.
+#[error_code]
+pub enum ConfidentialTokenError {
+    /// Token owner did not match the required signer.
+    #[msg("Token owner does not match signer")]
+    OwnerMismatch,
+    /// Token account mint did not match the supplied mint.
+    #[msg("Token account mint does not match")]
+    MintMismatch,
+    /// Confidential mint account shape is invalid.
+    #[msg("Confidential mint account is invalid")]
+    MintAccountMismatch,
+    /// Confidential mint authority did not match the required signer.
+    #[msg("Confidential mint authority does not match signer")]
+    MintAuthorityMismatch,
+    /// The instruction included undeclared trailing account metas.
+    #[msg("instruction has unexpected remaining accounts")]
+    UnexpectedRemainingAccounts,
+    /// Token account was not the canonical owner/mint PDA.
+    #[msg("Confidential token account is not canonical")]
+    TokenAccountMismatch,
+    /// Underlying SPL mint did not match the confidential mint metadata.
+    #[msg("Underlying mint does not match confidential mint")]
+    UnderlyingMintMismatch,
+    /// Vault token account owner did not match the vault authority PDA.
+    #[msg("Vault token account authority does not match vault authority PDA")]
+    VaultAuthorityMismatch,
+    /// Vault token account was not the mint's canonical associated token account.
+    #[msg("Vault token account is not the canonical mint vault")]
+    VaultAccountMismatch,
+    /// Current EncryptedStore account did not match token account state.
+    #[msg("current encrypted value does not match token account state")]
+    CurrentEncryptedStoreMismatch,
+    /// Transfer amount handle does not carry the expected confidential balance type.
+    #[msg("transfer amount handle type is invalid")]
+    AmountHandleTypeMismatch,
+    /// Transfer amount ACL record is not scoped to the sender token account.
+    #[msg("transfer amount ACL record is invalid")]
+    AmountAclMismatch,
+    /// The attested input's user does not match the transaction owner/authority.
+    #[msg("attested input user does not match owner")]
+    AttestationUserMismatch,
+    /// The attested input's contract is not this program.
+    #[msg("attested input contract does not match the token program")]
+    AttestationContractMismatch,
+    /// The signer spending an existing amount value neither controls it nor owns the token
+    /// account that does. Token-level spend gate mirroring EVM's `FHE.isAllowed(amount,
+    /// msg.sender)`: computing on a value is admitted by its authority's signature.
+    #[msg("amount value spender does not control the amount")]
+    AmountSpendAuthorityMismatch,
+    /// The FHE execution requires an output authority that was not provided.
+    #[msg("FHE execution is missing a required output authority")]
+    MissingFheOutputAuthority,
+    /// The host public-decrypt verifier CPI did not return well-formed `(handle, cleartext)`
+    /// data, or the return was not produced by the ZamaHost program.
+    #[msg("public-decrypt verifier return data is invalid")]
+    VerifierReturnDataInvalid,
+    /// The handle the KMS certificate covers did not equal the caller-pinned handle.
+    #[msg("disclosed handle does not match the pinned handle")]
+    DisclosedHandleMismatch,
+    /// The certified `uint256` cleartext does not fit the token's euint64 width (nonzero high bytes).
+    #[msg("certified cleartext exceeds euint64 width")]
+    CleartextExceedsEuint64,
+    /// The pending-burn PDA is already initialized (or is not a fresh system-owned empty account).
+    #[msg("pending burn is already initialized")]
+    PendingBurnAlreadyInitialized,
+    /// Redeem/cancel requires the burned handle to still be the burned-amount encrypted value
+    /// Store's current slot handle.
+    #[msg("pending burn handle is not the burned amount current handle")]
+    PendingBurnHandleNotCurrent,
+    /// Pending-burn account fields do not match the redeem/cancel accounts.
+    #[msg("pending burn fields do not match")]
+    PendingBurnMismatch,
+    /// The supplied token program does not own the underlying mint or token account.
+    #[msg("underlying token program does not match")]
+    UnderlyingTokenProgramMismatch,
+    /// Token-2022 extensions are unsupported unless explicitly allowed by the wrapper.
+    #[msg("unsupported Token-2022 extension")]
+    UnsupportedToken2022Extension,
+    /// A frozen underlying token account cannot participate in wrap, transfer, burn, or redeem.
+    #[msg("underlying token account is frozen")]
+    UnderlyingTokenAccountFrozen,
+    /// The disclosed encrypted store does not match the declared token state field.
+    #[msg("disclosed value does not match its declared token state field")]
+    DisclosedValueBindingMismatch,
+    /// An encrypted store is not controlled by the supplied token account PDA.
+    #[msg("encrypted store authority does not match token account")]
+    EncryptedStoreAuthorityMismatch,
+    /// A token encrypted value does not belong to this program and mint at the expected
+    /// authority and label.
+    #[msg("token encrypted store is not canonical")]
+    TokenEncryptedStoreMismatch,
+    /// Freeze checks bind the owner's associated token account for the wrapped mint.
+    #[msg("underlying associated token account does not match")]
+    UnderlyingAssociatedAccountMismatch,
+    /// Result grants require a state, its signing authority, and transient store; self-transfers cannot grant a result.
+    #[msg("invalid result grant accounts or self-transfer result request")]
+    ResultGrantMismatch,
+}

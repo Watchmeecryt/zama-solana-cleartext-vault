@@ -1,0 +1,107 @@
+//! Instruction account contexts and handlers for the confidential batcher.
+//!
+//! The public Anchor entrypoints in `lib.rs` delegate into these modules so
+//! account contexts, validation, and handler logic stay out of the crate root.
+
+pub mod cancel_dispatch;
+pub mod claim;
+pub mod close_join_record;
+pub mod dispatch;
+pub mod initialize_batcher;
+pub mod join;
+pub mod open_batch;
+pub mod quit;
+pub mod reclaim_batch_authority;
+pub mod settle;
+
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Mint as SplMint, Token, TokenAccount};
+use confidential_token::{self as ct, program::ConfidentialToken};
+use demo_vault::program::DemoVault;
+use zama_host::program::ZamaHost;
+
+use crate::{constants::*, errors::*, events::*, fhe, state::*};
+
+pub use cancel_dispatch::*;
+pub use claim::*;
+pub use close_join_record::*;
+pub use dispatch::*;
+pub use initialize_batcher::*;
+pub use join::*;
+pub use open_batch::*;
+pub use quit::*;
+pub use reclaim_batch_authority::*;
+pub use settle::*;
+
+/// Moves lamports from the transaction payer to the batch authority PDA, which
+/// pays the rent that token CPIs charge to the account owner (token-account
+/// creation at `open_batch`, execution growth at `cancel_dispatch` and `settle`).
+/// `dispatch` opens the pending burn with its caller's payer instead.
+/// Unspent lamports stay on the PDA until the batch is finished, when
+/// `reclaim_batch_authority` returns them to the join mint's wrapper authority.
+pub(crate) fn fund_batch_authority<'info>(
+    payer: &Signer<'info>,
+    batch_authority: &UncheckedAccount<'info>,
+    system_program: &Program<'info, System>,
+    lamports: u64,
+) -> Result<()> {
+    if lamports == 0 {
+        return Ok(());
+    }
+    anchor_lang::system_program::transfer(
+        CpiContext::new(
+            system_program.key(),
+            anchor_lang::system_program::Transfer {
+                from: payer.to_account_info(),
+                to: batch_authority.to_account_info(),
+            },
+        ),
+        lamports,
+    )
+}
+
+/// Splits an instruction's remaining accounts into the deny records of each of its FHE executions,
+/// in execution order. While the host's deny list is on, execution `i` takes `counts[i]` records:
+/// one per application it touches, in first-occurrence order. While it is off, there are none.
+/// The token and the host check each record against its application.
+pub(crate) fn split_deny_records<'a, 'info, const N: usize>(
+    host_config: &zama_host::HostConfig,
+    remaining_accounts: &'a [AccountInfo<'info>],
+    counts: [usize; N],
+) -> Result<[&'a [AccountInfo<'info>]; N]> {
+    let counts = if host_config.grant_deny_list_enabled {
+        counts
+    } else {
+        [0; N]
+    };
+    require_eq!(
+        remaining_accounts.len(),
+        counts.iter().sum::<usize>(),
+        BatcherError::DenyRecordsMismatch
+    );
+    let mut rest = remaining_accounts;
+    Ok(counts.map(|count| {
+        let (records, tail) = rest.split_at(count);
+        rest = tail;
+        records
+    }))
+}
+
+/// Signer-seed bytes for a batch authority PDA.
+pub(crate) struct BatchAuthoritySeeds {
+    batch: Pubkey,
+    bump: [u8; 1],
+}
+
+impl BatchAuthoritySeeds {
+    pub(crate) fn new(batch: Pubkey, bump: u8) -> Self {
+        Self {
+            batch,
+            bump: [bump],
+        }
+    }
+
+    pub(crate) fn seeds(&self) -> [&[u8]; 3] {
+        [BATCH_AUTHORITY_SEED, self.batch.as_ref(), &self.bump]
+    }
+}

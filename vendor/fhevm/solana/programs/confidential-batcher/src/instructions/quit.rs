@@ -1,0 +1,262 @@
+//! Leaves a pending or refunding batch: exact refund of the recorded joined amount,
+//! all-or-nothing. Direction-free, and the demo's only exit before claims:
+//! quit-before-dispatch and refunds after `cancel_dispatch` are in scope. A Refunding batch accepts
+//! quits only; it cannot return to Pending or proceed to settlement.
+//!
+//! The JoinRecord authority signs access to the contribution slot as the transfer
+//! amount (`confidential_transfer_from_value` back to the user), then resets
+//! the contribution slot to an encrypted zero so a later re-join accumulates from zero.
+//! The refund can never partially fail: the batch account's balance is the sum
+//! of all recorded joins, so `ge(balance, joined)` always holds pending.
+//!
+//! Every quit closes the JoinRecord to the user. A later join in a pending batch recreates the
+//! record at the same address and reuses the reset join store.
+//!
+//! Leaving a pending batch is the user's choice, so the user signs. A refunding batch can only pay
+//! back, to the user's own account, so anyone may run its quit for the user.
+
+use super::*;
+
+/// Accounts for quitting a batch.
+#[derive(Accounts)]
+pub struct Quit<'info> {
+    /// Quitting user; owner of the refund destination. Signs a pending batch's quit. Receives the
+    /// join record's rent.
+    /// CHECK: the join record and the refund destination are derived from this key below.
+    #[account(mut)]
+    pub user: UncheckedAccount<'info>,
+    /// Pays the transfer output rent and the reset execution's ACL rent.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// Batcher config.
+    pub batcher: Box<Account<'info, Batcher>>,
+    /// The pending or refunding batch being quit.
+    #[account(constraint = batch.batcher == batcher.key() @ BatcherError::BatchBatcherMismatch)]
+    pub batch: Box<Account<'info, Batch>>,
+    /// Owns the token account funding the refund.
+    /// CHECK: canonical per-batch authority PDA, checked by seeds below.
+    #[account(seeds = [BATCH_AUTHORITY_SEED, batch.key().as_ref()], bump = batch.authority_bump)]
+    pub batch_authority: UncheckedAccount<'info>,
+    /// The user's join record for this batch; closed to the user.
+    #[account(
+        mut,
+        close = user,
+        seeds = [JOIN_RECORD_SEED, batch.key().as_ref(), user.key().as_ref()],
+        bump = join_record.bump,
+    )]
+    pub join_record: Box<Account<'info, JoinRecord>>,
+    /// Confidential mint users join batches with.
+    pub join_confidential_mint: Box<Account<'info, ct::ConfidentialMint>>,
+    /// CHECK: underlying SPL mint wrapped by `join_confidential_mint`. Token program is its owner.
+    pub join_underlying_mint: UncheckedAccount<'info>,
+    /// CHECK: ATA of `batch_authority` on `join_underlying_mint`. Uninitialized → not frozen.
+    pub batch_authority_ata: UncheckedAccount<'info>,
+    /// CHECK: ATA of `user` on `join_underlying_mint`. Uninitialized → not frozen.
+    pub user_ata: UncheckedAccount<'info>,
+    /// CHECK: batch's confidential join token account (refund source);
+    /// validated by the token CPI and pinned below.
+    #[account(mut)]
+    pub batch_join_token_account: UncheckedAccount<'info>,
+    /// CHECK: user's canonical confidential token account (refund destination); pinned below
+    /// so the refund can only land with the quitting user, never back on the batch account.
+    #[account(mut)]
+    pub user_token_account: UncheckedAccount<'info>,
+    /// CHECK: batch's stable balance encrypted store; replaced by the token CPI.
+    #[account(mut)]
+    pub batch_balance_store: UncheckedAccount<'info>,
+    /// CHECK: user's stable balance encrypted store; replaced by the token CPI.
+    #[account(mut)]
+    pub user_balance_store: UncheckedAccount<'info>,
+    /// CHECK: the user's joined encrypted store; spent read-only as the refund
+    /// amount, then reset to an encrypted zero by the batcher execution.
+    #[account(mut)]
+    pub join_store: UncheckedAccount<'info>,
+    /// CHECK: Anchor event CPI authority for the Zama host program.
+    #[account(seeds = [b"__event_authority"], bump = zama_host::EVENT_AUTHORITY_AND_BUMP.1, seeds::program = zama_host::ID)]
+    pub zama_event_authority: UncheckedAccount<'info>,
+    /// CHECK: shared transaction transient store, validated by ZamaHost.
+    #[account(mut)]
+    pub transient_store: UncheckedAccount<'info>,
+    /// CHECK: runtime Instructions sysvar, validated by ZamaHost.
+    pub instructions: UncheckedAccount<'info>,
+    /// ZamaHost program (FHE compute + ACL).
+    pub zama_program: Program<'info, ZamaHost>,
+    #[account(seeds = [zama_host::HOST_CONFIG_SEED], bump = host_config.bump, seeds::program = zama_host::ID)]
+    pub host_config: Box<Account<'info, zama_host::HostConfig>>,
+    /// CHECK: confidential-token event-CPI authority; validated by the token program.
+    pub confidential_token_event_authority: UncheckedAccount<'info>,
+    /// confidential-token program composed via CPI.
+    pub confidential_token_program: Program<'info, ConfidentialToken>,
+    /// System program used for account creation.
+    pub system_program: Program<'info, System>,
+    /// The join mint's HCU block meter for the token CPI. Supplied while the block cap binds and the
+    /// application is not trusted.
+    /// CHECK: validated by ZamaHost.
+    #[account(mut)]
+    pub join_mint_hcu_block_meter: Option<UncheckedAccount<'info>>,
+    /// The join mint's HCU trust record for the token CPI. Supplied while the block cap binds and the
+    /// application is trusted.
+    /// CHECK: validated by ZamaHost.
+    pub join_mint_hcu_trusted_app_record: Option<UncheckedAccount<'info>>,
+    /// The batch's HCU block meter for the batcher's own execution. Supplied while the block cap binds and the
+    /// application is not trusted.
+    /// CHECK: validated by ZamaHost.
+    #[account(mut)]
+    pub batch_hcu_block_meter: Option<UncheckedAccount<'info>>,
+    /// The batch's HCU trust record for the batcher's own execution. Supplied while the block cap binds and the
+    /// application is trusted.
+    /// CHECK: validated by ZamaHost.
+    pub batch_hcu_trusted_app_record: Option<UncheckedAccount<'info>>,
+}
+
+/// Refunds the exact recorded amount, resets the joined encrypted store to zero and closes the join
+/// record.
+pub fn quit<'info>(ctx: Context<'info, Quit<'info>>) -> Result<()> {
+    require!(
+        matches!(
+            ctx.accounts.batch.status,
+            BatchStatus::Pending | BatchStatus::Refunding
+        ),
+        BatcherError::BatchNotRefundable
+    );
+    if ctx.accounts.batch.status == BatchStatus::Pending {
+        require!(ctx.accounts.user.is_signer, ErrorCode::AccountNotSigner);
+    }
+    require_keys_eq!(
+        ctx.accounts.join_confidential_mint.key(),
+        ctx.accounts.batcher.join_confidential_mint,
+        BatcherError::ConfidentialMintMismatch
+    );
+    require_keys_eq!(
+        ctx.accounts.join_store.key(),
+        join_store_id(ctx.accounts.batch.key(), ctx.accounts.join_record.key()).address(),
+        BatcherError::DerivedAccountMismatch
+    );
+    let mint_key = ctx.accounts.join_confidential_mint.key();
+    let batch_key = ctx.accounts.batch.key();
+    let user = ctx.accounts.user.key();
+    let batch_authority = ctx.accounts.batch_authority.key();
+    require_keys_eq!(
+        ctx.accounts.batch_join_token_account.key(),
+        ct::token_account_address(mint_key, batch_authority).0,
+        BatcherError::DerivedAccountMismatch
+    );
+    // A destination equal to the source is a no-op transfer that the token program accepts;
+    // phase 2 would then zero the join while the balance stays on the batch account and is
+    // shared out to everyone else at settle. Pinning the destination to the user's canonical
+    // account rules that out, since the batch authority is a PDA and can never be the signer.
+    require_keys_eq!(
+        ctx.accounts.user_token_account.key(),
+        ct::token_account_address(mint_key, user).0,
+        BatcherError::DerivedAccountMismatch
+    );
+
+    // Phase 1: refund the contribution slot's amount. The batch authority signs to spend
+    // from the batch's token account; the JoinRecord signs to read its contribution Store.
+    let authority = BatchAuthoritySeeds::new(batch_key, ctx.accounts.batch.authority_bump);
+    let authority_seeds = authority.seeds();
+    let bump = [ctx.accounts.join_record.bump];
+    let record_seeds: &[&[u8]] = &[JOIN_RECORD_SEED, batch_key.as_ref(), user.as_ref(), &bump];
+    // The refund reads the join store, so its token execution also touches the batch application.
+    let [refund_deny_records, reset_deny_records] =
+        split_deny_records(&ctx.accounts.host_config, ctx.remaining_accounts, [2, 1])?;
+    refund_contribution(&ctx, &[&authority_seeds, record_seeds], refund_deny_records)?;
+
+    let account = fhe::read_state(&ctx.accounts.join_store)?;
+    let output = zama_fhe::Store::new(&account)
+        .set(JOINED_AMOUNT_KEY)
+        .allow(user);
+    let execution =
+        zama_fhe::FheExecution::build_returning(zama_fhe::Store::new(&account).id(), |builder| {
+            let zero = builder.trivial_encrypt_u64(0)?;
+            builder.output(zero, output)?;
+            Ok(zero)
+        })?;
+    fhe::JoinExecute {
+        batch: batch_key,
+        user,
+        bump: ctx.accounts.join_record.bump,
+        record: ctx.accounts.join_record.to_account_info(),
+        payer: ctx.accounts.payer.to_account_info(),
+        host_config: ctx.accounts.host_config.to_account_info(),
+        event_authority: ctx.accounts.zama_event_authority.to_account_info(),
+        transient_store: ctx.accounts.transient_store.to_account_info(),
+        instructions: ctx.accounts.instructions.to_account_info(),
+        program: ctx.accounts.zama_program.to_account_info(),
+        system_program: ctx.accounts.system_program.to_account_info(),
+        deny_records: reset_deny_records,
+        hcu_block_meter: ctx
+            .accounts
+            .batch_hcu_block_meter
+            .as_ref()
+            .map(|account| account.to_account_info()),
+        hcu_trusted_app_record: ctx
+            .accounts
+            .batch_hcu_trusted_app_record
+            .as_ref()
+            .map(|account| account.to_account_info()),
+    }
+    .invoke(execution, vec![ctx.accounts.join_store.to_account_info()])?;
+
+    emit!(QuitBatch {
+        version: APP_EVENT_VERSION,
+        batch: batch_key,
+        user,
+    });
+    Ok(())
+}
+
+// Keep CPI account assembly in a separate SBF function; Quit also builds the reset execution.
+#[inline(never)]
+fn refund_contribution<'info>(
+    ctx: &Context<'info, Quit<'info>>,
+    signer_seeds: &[&[&[u8]]],
+    deny_records: &[AccountInfo<'info>],
+) -> Result<()> {
+    ct::cpi::confidential_transfer_from_value(
+        CpiContext::new_with_signer(
+            ctx.accounts.confidential_token_program.key(),
+            ct::cpi::accounts::ConfidentialTransferFromValue {
+                owner: ctx.accounts.batch_authority.to_account_info(),
+                payer: ctx.accounts.payer.to_account_info(),
+                mint: ctx.accounts.join_confidential_mint.to_account_info(),
+                underlying_mint: ctx.accounts.join_underlying_mint.to_account_info(),
+                from_ata: ctx.accounts.batch_authority_ata.to_account_info(),
+                to_ata: ctx.accounts.user_ata.to_account_info(),
+                from_account: ctx.accounts.batch_join_token_account.to_account_info(),
+                to_account: ctx.accounts.user_token_account.to_account_info(),
+                from_store: ctx.accounts.batch_balance_store.to_account_info(),
+                to_store: ctx.accounts.user_balance_store.to_account_info(),
+                amount_store: Some(ctx.accounts.join_store.to_account_info()),
+                amount_authority: Some(ctx.accounts.join_record.to_account_info()),
+
+                zama_event_authority: ctx.accounts.zama_event_authority.to_account_info(),
+                transient_store: ctx.accounts.transient_store.to_account_info(),
+                instructions: ctx.accounts.instructions.to_account_info(),
+                zama_program: ctx.accounts.zama_program.to_account_info(),
+                host_config: ctx.accounts.host_config.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                hcu_block_meter: ctx
+                    .accounts
+                    .join_mint_hcu_block_meter
+                    .as_ref()
+                    .map(|account| account.to_account_info()),
+                hcu_trusted_app_record: ctx
+                    .accounts
+                    .join_mint_hcu_trusted_app_record
+                    .as_ref()
+                    .map(|account| account.to_account_info()),
+                event_authority: ctx
+                    .accounts
+                    .confidential_token_event_authority
+                    .to_account_info(),
+                program: ctx.accounts.confidential_token_program.to_account_info(),
+            },
+            signer_seeds,
+        )
+        .with_remaining_accounts(deny_records.to_vec()),
+        ct::TransferInput::Slot {
+            key: JOINED_AMOUNT_KEY,
+        },
+    )
+}

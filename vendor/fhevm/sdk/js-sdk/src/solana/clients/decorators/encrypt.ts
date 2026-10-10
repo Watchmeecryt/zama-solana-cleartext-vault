@@ -1,0 +1,116 @@
+import type { EncryptedValue } from '../../../core/types/encryptedTypes.js';
+import { asEncryptedValue } from '../../../core/handle/EncryptedValue.js';
+import type { RelayerInputProofOptions } from '../../../core/types/relayer.js';
+import type { Bytes32Hex } from '../../../core/types/primitives.js';
+import type { FhevmSolanaChain } from '../../../core/types/fhevmSolanaChain.js';
+import type { FhevmBase, FhevmExtension, OptionalNativeClient } from '../../../core/types/coreFhevmClient.js';
+import type { FhevmRuntime, WithEncrypt } from '../../../core/types/coreFhevmRuntime.js';
+import type { EncryptModuleFactory } from '../../../core/modules/encrypt/types.js';
+import type { SolanaEncryptInputParameters, SolanaEncryptInputResult } from '../../actions/encryptInput.js';
+import type { SolanaSubmitInputProofParameters, SolanaSubmitInputProofResult } from '../../actions/submitInputProof.js';
+import {
+  asFhevmWith,
+  getFrozenContext,
+  initPublicAction,
+  setFrozenContext,
+} from '../../../core/runtime/CoreFhevm-p.js';
+import { createFhevmClientFrozenContext } from '../../../core/frozenContext/fhevmClientFrozenContext-p.js';
+import { encryptInput } from '../../actions/encryptInput.js';
+
+////////////////////////////////////////////////////////////////////////////////
+
+/** Submitted coprocessor attestation, ready to encode in a Solana instruction. */
+export type SolanaInputProof = SolanaSubmitInputProofResult & {
+  readonly chainId: bigint;
+  readonly aclContractAddress: Bytes32Hex;
+  readonly contractAddress: Bytes32Hex;
+  readonly userAddress: Bytes32Hex;
+};
+
+export type SolanaEncryptValuesResult = {
+  readonly encryptedValues: readonly EncryptedValue[];
+  readonly inputProof: SolanaInputProof;
+};
+
+export type SolanaEncryptActions = {
+  readonly encryptValues: (
+    parameters: SolanaEncryptInputParameters & { readonly options?: RelayerInputProofOptions | undefined },
+  ) => Promise<SolanaEncryptValuesResult>;
+  /** Builds a Solana input ZK proof (RFC-021 bytes32 identities + 128-byte aux). */
+  readonly generateZkProof: (parameters: SolanaEncryptInputParameters) => Promise<SolanaEncryptInputResult>;
+  /** Submits a built Solana input proof and verifies the returned handles. */
+  readonly submitInputProof: (parameters: SolanaSubmitInputProofParameters) => Promise<SolanaSubmitInputProofResult>;
+};
+
+////////////////////////////////////////////////////////////////////////////////
+
+type SolanaClientBase = FhevmBase<undefined, FhevmRuntime, undefined>;
+
+/** Where an input is encrypted and who attests it. */
+export type SolanaEncryptBackend = {
+  readonly encryptModule: EncryptModuleFactory;
+  readonly submitInputProof: (
+    context: { readonly runtime: FhevmRuntime; readonly solanaChain: FhevmSolanaChain },
+    parameters: SolanaSubmitInputProofParameters,
+  ) => Promise<SolanaSubmitInputProofResult>;
+};
+
+async function _initEncrypt(fhevm: FhevmBase<undefined, FhevmRuntime, OptionalNativeClient>): Promise<void> {
+  const f = asFhevmWith(fhevm, 'encrypt');
+
+  await f.runtime.encrypt.initTfheModule();
+
+  // Solana has no on-chain protocol context to resolve; the SDK's single WASM version applies.
+  if (getFrozenContext(fhevm) === undefined) {
+    setFrozenContext(fhevm, createFhevmClientFrozenContext({}));
+  }
+}
+
+/**
+ * Attaches the Solana encrypt actions to a base Solana client, extending the runtime with the
+ * backend's encrypt module. Mirrors the EVM encrypt decorator.
+ *
+ * @param aclProgramAddress - The zama-host program id as bytes32 (the Solana ACL identity).
+ * @param backend - The prover and the attester.
+ */
+export function solanaEncryptActions(
+  aclProgramAddress: Bytes32Hex,
+  solanaChain: FhevmSolanaChain,
+  backend: SolanaEncryptBackend,
+): (fhevm: SolanaClientBase) => FhevmExtension<SolanaEncryptActions, WithEncrypt> {
+  return (fhevm: SolanaClientBase): FhevmExtension<SolanaEncryptActions, WithEncrypt> => {
+    const runtime = fhevm.runtime.extend(backend.encryptModule);
+    const attest = backend.submitInputProof;
+
+    const generateZkProof: SolanaEncryptActions['generateZkProof'] = async (parameters) => {
+      await initPublicAction(fhevm);
+      return encryptInput({ chain: solanaChain, aclProgramAddress, runtime }, parameters);
+    };
+
+    return {
+      actions: {
+        generateZkProof,
+        encryptValues: async (parameters) => {
+          const inputProof = await generateZkProof(parameters);
+          const result = await attest({ runtime, solanaChain }, { inputProof, options: parameters.options });
+          return {
+            encryptedValues: result.handles.map(asEncryptedValue),
+            inputProof: {
+              ...result,
+              chainId: inputProof.chainId,
+              aclContractAddress: inputProof.aclContractAddress,
+              contractAddress: inputProof.contractAddress,
+              userAddress: inputProof.userAddress,
+            },
+          };
+        },
+        submitInputProof: async (parameters) => {
+          await initPublicAction(fhevm);
+          return attest({ runtime, solanaChain }, parameters);
+        },
+      },
+      runtime,
+      init: _initEncrypt as (fhevm: FhevmBase) => Promise<void>,
+    };
+  };
+}

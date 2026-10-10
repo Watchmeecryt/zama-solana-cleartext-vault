@@ -1,0 +1,51 @@
+import type { SolanaInputProof } from './decorators/encrypt.js';
+import type { EncryptedValue } from '../../core/types/encryptedTypes.js';
+import type { FhevmSolanaChain } from '../../core/types/fhevmSolanaChain.js';
+import type { SolanaEncryptActions, SolanaEncryptBackend } from './decorators/encrypt.js';
+import type { FhevmRuntime } from '../../core/types/coreFhevmRuntime.js';
+import type { FhevmSolanaBaseClient, SolanaClientParameters, SolanaEncryptOptions } from './createFhevmBaseClient.js';
+import { createSolanaCore, solanaClientSurface } from './createFhevmBaseClient.js';
+import { solanaEncryptActions } from './decorators/encrypt.js';
+import { encryptModule } from '../../core/modules/encrypt/module/index.js';
+import { submitInputProof } from '../actions/submitInputProof.js';
+import { getSolanaRuntime } from '../internal/runtime.js';
+
+export type FhevmSolanaEncryptClient<C extends FhevmSolanaChain = FhevmSolanaChain> = FhevmSolanaBaseClient<C> &
+  SolanaEncryptActions & {
+    readonly encryptValue: (
+      parameters: SolanaEncryptValueParameters,
+    ) => Promise<{ readonly encryptedValue: EncryptedValue; readonly inputProof: SolanaInputProof }>;
+  };
+
+export type SolanaEncryptValueParameters = Omit<Parameters<SolanaEncryptActions['encryptValues']>[0], 'values'> & {
+  readonly value: Parameters<SolanaEncryptActions['encryptValues']>[0]['values'][number];
+};
+
+/** Creates an encrypt client using the host identity from its chain configuration. */
+export function createFhevmEncryptClient<C extends FhevmSolanaChain>(
+  parameters: SolanaClientParameters<C> & { readonly options?: SolanaEncryptOptions | undefined },
+): FhevmSolanaEncryptClient<C> {
+  return createSolanaEncryptClient(parameters, getSolanaRuntime(), { encryptModule, submitInputProof });
+}
+
+/** The encrypt client over a given runtime and backend; the cleartext client supplies both. */
+export function createSolanaEncryptClient<C extends FhevmSolanaChain>(
+  parameters: SolanaClientParameters<C> & { readonly options?: SolanaEncryptOptions | undefined },
+  runtime: FhevmRuntime,
+  backend: SolanaEncryptBackend,
+): FhevmSolanaEncryptClient<C> {
+  const core = createSolanaCore(parameters, runtime).extend(
+    solanaEncryptActions(parameters.chain.fhevm.programs.host.address, parameters.chain, backend),
+  );
+  return Object.assign(solanaClientSurface(core, parameters), {
+    generateZkProof: core.generateZkProof,
+    submitInputProof: core.submitInputProof,
+    encryptValues: core.encryptValues,
+    encryptValue: async ({ value, ...request }: SolanaEncryptValueParameters) => {
+      const result = await core.encryptValues({ ...request, values: [value] });
+      const encryptedValue = result.encryptedValues[0];
+      if (encryptedValue === undefined) throw new Error('Encryption returned no value');
+      return { encryptedValue, inputProof: result.inputProof };
+    },
+  });
+}

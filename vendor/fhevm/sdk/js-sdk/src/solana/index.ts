@@ -1,0 +1,102 @@
+export type { SolanaRuntimeConfig } from './internal/config.js';
+export { setFhevmRuntimeConfig, hasFhevmRuntimeConfig } from './internal/config.js';
+
+export { createFhevmBaseClient } from './clients/createFhevmBaseClient.js';
+export { createFhevmDecryptClient } from './clients/createFhevmDecryptClient.js';
+export type { FhevmSolanaDecryptClient, SolanaDecryptValueParameters } from './clients/createFhevmDecryptClient.js';
+export type {
+  SolanaPermitDecryptActions,
+  SolanaSignPermitParameters,
+  SolanaUserDecryptEntry,
+  SolanaUserDecryptParameters,
+} from './clients/decorators/permitDecrypt.js';
+
+export {
+  solanaPermitWalletFromSecretKey,
+  SolanaPermitError,
+  SolanaPermitChannelError,
+  SOLANA_SIGN_OFFCHAIN_MESSAGE_FEATURE,
+} from './permit/index.js';
+export type { SolanaPermitWallet, SolanaSignedPermit, SolanaPermitWarning } from './permit/index.js';
+export type { SolanaPermitSession } from './userDecrypt/execute.js';
+export { SolanaUserDecryptRunError } from './userDecrypt/session.js';
+export { SolanaUserDecryptRequestError } from './userDecrypt/request.js';
+export type {
+  FhevmSolanaBaseClient,
+  SolanaClientParameters,
+  SolanaEncryptOptions,
+} from './clients/createFhevmBaseClient.js';
+export type {
+  SolanaDecryptPublicValueParameters,
+  SolanaDecryptPublicValuesParameters,
+} from './actions/decryptPublicValue.js';
+
+export { decodeSolanaEncryptedStore, encryptedStoreHandle, fetchSolanaEncryptedStore } from './encryptedStore.js';
+export type { SolanaEncryptedStore, SolanaRpc } from './encryptedStore.js';
+export { createFhevmPublicDecryptClient } from './clients/createFhevmPublicDecryptClient.js';
+export type { FhevmSolanaPublicDecryptClient } from './clients/createFhevmPublicDecryptClient.js';
+export { createFhevmEncryptClient } from './clients/createFhevmEncryptClient.js';
+export type { FhevmSolanaEncryptClient } from './clients/createFhevmEncryptClient.js';
+export { clearSolanaEncryptionKeyCache } from './encryptionKeyCache.js';
+
+export type {
+  SolanaPublicDecryptCertificateClaim,
+  SolanaPublicDecryptCertificateParameters,
+} from './actions/publicDecryptCertificate.js';
+export { solanaPublicDecryptContextId } from './actions/publicDecryptCertificate.js';
+export {
+  buildVerifyPublicDecryptInstruction,
+  verifyPublicDecryptArgsFromClaim,
+} from './actions/verifyPublicDecrypt.js';
+export type {
+  SolanaVerifyPublicDecryptAccounts,
+  SolanaVerifyPublicDecryptArgs,
+} from './actions/verifyPublicDecrypt.js';
+export {
+  SOLANA_WILDCARD_APP_WARNING,
+  SOLANA_WILDCARD_APP,
+  buildDelegateForUserDecryptionInstruction,
+  buildRevokeDelegationForUserDecryptionInstruction,
+  decodeSolanaUserDecryptionDelegation,
+  fetchSolanaUserDecryptionDelegation,
+  isSolanaUserDecryptionDelegationLiveAt,
+  solanaDelegationWarnings,
+} from './actions/userDecryptionDelegation.js';
+export type {
+  SolanaDelegateForUserDecryptionParameters,
+  SolanaDelegationApplication,
+  SolanaDelegationWarning,
+  SolanaRevokeDelegationForUserDecryptionParameters,
+  SolanaUserDecryptionDelegationRecord,
+  SolanaSignerOrAddress,
+  SolanaUserDecryptionDelegationRows,
+  SolanaUserDecryptionDelegationTuple,
+  SolanaZamaHostAddressConfig,
+} from './actions/userDecryptionDelegation.js';
+export { buildRevokePermitsInstruction } from './actions/revokePermits.js';
+export type { SolanaPublicDecryptActions } from './clients/decorators/publicDecrypt.js';
+
+export type {
+  SolanaEncryptInputParameters,
+  SolanaEncryptInputResult,
+  SolanaEncryptInputValue,
+} from './actions/encryptInput.js';
+export type { SolanaSubmitInputProofParameters, SolanaSubmitInputProofResult } from './actions/submitInputProof.js';
+export type { SolanaEncryptActions } from './clients/decorators/encrypt.js';
+export type { SolanaZkProof, SolanaZkProofLike } from '../core/types/zkProof-p.js';
+
+export type { FhevmSolanaChain } from '../core/types/fhevmSolanaChain.js';
+export { defineFhevmSolanaChain } from '../core/chains/utilsSolana.js';
+export { isSolanaHostChainId } from '../core/chains/hostChainId.js';
+
+export { INSTRUCTIONS_SYSVAR_ADDRESS, prepareTransientStore, transientStoreTransactions } from './transientStore.js';
+export type { FheTransactionClient, TransientStore, TransientStoreTransactions } from './transientStore.js';
+export { solanaHostProgram } from './clients/createFhevmBaseClient.js';
+
+export { toSolanaZkProof } from '../core/coprocessor/SolanaZkProof-p.js';
+
+export { assertHandleArrayEquals, bytes32HexToHandle } from '../core/handle/FhevmHandle.js';
+
+export type { SolanaInputProof, SolanaEncryptValuesResult } from './clients/decorators/encrypt.js';
+
+export type { SolanaEncryptValueParameters } from './clients/createFhevmEncryptClient.js';

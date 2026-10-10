@@ -1,0 +1,81 @@
+//! Public sealing of a current Store slot.
+
+use super::common::*;
+use crate::{errors::ZamaHostError, state::*};
+use anchor_lang::prelude::*;
+
+#[derive(Accounts)]
+pub struct MakeStoreHandlePublic<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub authority: Signer<'info>,
+    #[account(mut, seeds = [ENCRYPTED_STORE_SEED, encrypted_store.program.as_ref(), encrypted_store.authority.as_ref(), encrypted_store.scope.as_ref()], bump = encrypted_store.bump)]
+    pub encrypted_store: Account<'info, EncryptedStore>,
+    #[account(seeds = [HOST_CONFIG_SEED], bump = host_config.bump)]
+    pub host_config: Account<'info, HostConfig>,
+    /// CHECK: the canonical application deny witness is checked by the handler.
+    pub deny_scope_record: Option<UncheckedAccount<'info>>,
+    pub system_program: Program<'info, System>,
+}
+
+pub fn make_store_handle_public(
+    ctx: Context<MakeStoreHandlePublic>,
+    key: [u8; 32],
+    handle: [u8; 32],
+    previous_leaf_count: u64,
+) -> Result<()> {
+    assert_not_paused(&ctx.accounts.host_config, PauseArea::AclWrites)?;
+    assert_no_remaining_accounts(ctx.remaining_accounts)?;
+    let state = &mut ctx.accounts.encrypted_store;
+    state.validate_shape()?;
+    require_keys_eq!(
+        ctx.accounts.authority.key(),
+        state.authority,
+        ZamaHostError::EncryptedStoreAccountAuthorityMismatch
+    );
+    require!(
+        state.get(&key) == Some(handle),
+        ZamaHostError::EncryptedStorePublicHandleMismatch
+    );
+    require!(
+        state.leaf_count == previous_leaf_count,
+        ZamaHostError::EncryptedStoreMmrInconsistent
+    );
+    check_scope_not_denied(
+        &ctx.accounts.host_config,
+        AppScope {
+            program: state.program,
+            scope: state.scope,
+        },
+        ctx.accounts.deny_scope_record.as_ref(),
+    )?;
+    let commitment = zama_solana_acl::public_decrypt_leaf_commitment(
+        state.key().to_bytes(),
+        state.leaf_count,
+        handle,
+    );
+    let state_data: &mut EncryptedStore = state;
+    zama_solana_acl::mmr_append(
+        &mut state_data.peaks,
+        &mut state_data.leaf_count,
+        commitment,
+    )
+    .map_err(map_mmr_append_error)?;
+    let space = zama_solana_acl::EncryptedStore::account_size(state.slots.len(), state.peaks.len());
+    grow_account_if_needed(
+        &ctx.accounts.payer.to_account_info(),
+        &state.to_account_info(),
+        &ctx.accounts.system_program.to_account_info(),
+        space,
+    )?;
+    Ok(())
+}
+
+fn map_mmr_append_error(error: zama_solana_acl::AclError) -> anchor_lang::error::Error {
+    match error {
+        zama_solana_acl::AclError::MmrPeakCapacityExceeded => {
+            error!(ZamaHostError::EncryptedStoreMmrPeakCapacityExceeded)
+        }
+        _ => error!(ZamaHostError::EncryptedStoreMmrInconsistent),
+    }
+}
