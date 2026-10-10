@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "start": "bun run src/index.ts",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "check:runtime": "bun build src/index.ts --target=bun --outdir=/tmp/api-bundle"
   },
   "dependencies": {
     "@fhevm/confidential-token": "*",

@@ -12,7 +12,7 @@ import {
 import { findKmsContextPda } from '@fhevm/solana-zama-host';
 import { findVaultAuthorityPda as findTokenVaultAuthorityPda } from '@fhevm/confidential-token';
 import { prepareTransientStore, type TransientStore } from '@fhevm/sdk/solana';
-import { BRINGUP_KMS_CONTEXT_ID } from '../../../vendor/fhevm/solana/deploy/src/constants.js';
+import { BRINGUP_KMS_CONTEXT_ID } from './host/constants.js';
 import {
   BatchDirection,
   buildInitializeMintInstruction,

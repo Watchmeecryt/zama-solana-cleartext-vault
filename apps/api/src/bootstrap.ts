@@ -1,9 +1,8 @@
 import { createFinalizedRpc } from '@fhevm/solana-zama-host';
 import { SOLANA_CLEARTEXT_GATEWAY, SOLANA_CLEARTEXT_SIGNER_ADDRESSES } from '@fhevm/sdk/solana/cleartext';
 import type { TransactionSigner } from '@solana/kit';
-import { bootstrapZamaHost } from '../../../vendor/fhevm/solana/deploy/src/bootstrap.js';
-import { evmAddressBytes } from '../../../vendor/fhevm/solana/deploy/src/gateway.js';
-import { createHostDeployContext } from '../../../vendor/fhevm/solana/deploy/src/send.js';
+import { bootstrapZamaHost, evmAddressBytes } from './host/bootstrap.js';
+import { createHostDeployContext } from './host/send.js';
 import { env } from './env.js';
 
 export const fundAddress = async (rpcUrl: string, address: string, sol: number): Promise<void> => {
