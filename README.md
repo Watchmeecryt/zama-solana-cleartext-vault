@@ -136,8 +136,8 @@ Build time is long: the first stage compiles four Solana programs with the pinne
 
 ## Using the dApp
 
-- Default wallet is a built-in burner stored in `localStorage` (export / reset in the header).
-- Phantom or Solflare can connect if they sign Solana version-1 transactions. Point them at `/rpc` and `/rpc-ws` via **Custom RPC**.
+- Connect a built-in burner or a detected Wallet Standard wallet from **Connect wallet**. The last choice is stored in `localStorage` (`walletPreference`); **Disconnect** clears the session and does not auto-reconnect the burner.
+- Detected wallets that cannot sign Solana version-1 transactions stay in the list, disabled, with a tooltip. After an external connect, the header shows the custom RPC URL to paste into the wallet.
 - Pages: Overview, Faucet / Shield, Deposit, Portfolio (decrypt + redeem), Activity.
 
 Decrypt uses the cleartext user-decrypt client and a permit (`solana:signOffchainMessage` on the burner; required on external wallets).

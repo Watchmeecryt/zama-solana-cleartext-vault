@@ -203,6 +203,30 @@ button {
   justify-content: flex-end;
 }
 
+.wallet-rpc-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: min(420px, 100%);
+  padding: 4px 8px;
+  border: 1px solid #bfdbfe;
+  border-radius: 12px;
+  background: #eff6ff;
+  color: #1e3a8a;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.wallet-rpc-hint .mono {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wallet-disabled-hit {
+  display: block;
+}
+
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   word-break: break-all;
